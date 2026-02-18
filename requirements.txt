@@ -1,0 +1,7 @@
+transformers==4.57.1
+peft==0.17.1
+torch==2.5.1
+torch_audio==2.5.1
+flash-attn==2.7.4.post1 # flash-attn==2.8.3
+deepspeed==0.18.1
+lhotse==1.31.1
