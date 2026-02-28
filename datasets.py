@@ -22,7 +22,7 @@ class SALMONN_Dataset(Dataset):
             self.max_frames = 30 * 16000
         else:
             self.max_frames = 120 * 16000
-        self.audio_chunk = 30 * 16000
+        self.audio_chunk = 120 * 16000 # We set a longer audio chunk for Zipformer
         self.split_audio = args.split_audio
 
         self.data = json.load(open(args.data_path, "r"))["data"]
@@ -66,7 +66,9 @@ class SALMONN_Dataset(Dataset):
         audio_nums = []
         for audio_path in sample["audios"]:
             audio, fs = torchaudio.load(audio_path, num_frames=self.max_frames)
-            assert fs == 16000
+            if fs != 16000:
+                audio = torchaudio.functional.resample(audio, fs, 16000)
+                fs = 16000
             if self.encoder_type == "zipformer2":
                 if self.split_audio:
                     if audio.size(0) > 1:
