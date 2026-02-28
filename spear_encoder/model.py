@@ -161,6 +161,11 @@ class MultiKDModel(nn.Module):
         
         self.loss_only_mask = loss_only_mask
 
+    def forward_one_chunk(
+        self, x: torch.Tensor, x_lens: torch.Tensor,
+    ):
+        pass
+    
     def forward_encoder(
         self, x: torch.Tensor, x_lens: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -185,12 +190,12 @@ class MultiKDModel(nn.Module):
         src_key_padding_mask = make_pad_mask(x_lens)
         x = x.permute(1, 0, 2)  # (N, T, C) -> (T, N, C)
 
-        encoder_out, encoder_out_lens = self.encoder(x, x_lens, src_key_padding_mask)
+        encoder_out, encoder_out_lens, middle_out = self.encoder(x, x_lens, src_key_padding_mask, return_middle_out=True)
 
         encoder_out = encoder_out.permute(1, 0, 2)  # (T, N, C) ->(N, T, C)
         assert torch.all(encoder_out_lens > 0), (x_lens, encoder_out_lens)
 
-        return encoder_out, encoder_out_lens
+        return encoder_out, encoder_out_lens, middle_out
 
     def forward(
         self,
