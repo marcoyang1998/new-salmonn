@@ -61,7 +61,9 @@ def extract_audio_features(audio_paths: list[str], fbank: Fbank, model, model_ar
     feature_lens = []
     for audio_path in audio_paths:
         audio, fs = torchaudio.load(audio_path, num_frames=max_frames)
-        assert fs == 16000
+        if fs != 16000:
+            audio = torchaudio.functional.resample(audio, fs, 16000)
+            fs = 16000
 
         if model_args.encoder_type == "zipformer2":
             if split_audio:
