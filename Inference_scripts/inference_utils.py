@@ -348,5 +348,8 @@ def get_model_args(checkpoint_path: str):
             connector_type: str = "MLP"
             connector_seg_size: int = 5
             connector_hid_size: int = 4096
+            weighted_sum_encoder: bool = False
+            concat_encoder_features: bool = False
+            
 
     return ModelArguments()

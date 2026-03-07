@@ -11,14 +11,34 @@ from inference_utils import get_prompt, get_audio_path_list, extract_audio_featu
 import logging
 from pdb import set_trace as st
 
+TOKENIZER_PATH="/mnt/shared-storage-user/brainllm-share/checkpoints/Qwen3-8B"
+override_keys = ["weighted_sum_encoder", "concat_encoder_features"]
+
+logging.getLogger().setLevel(logging.INFO)
+
+def override_args(checkpoint_path: str, default_model_args):
+    config_file = os.path.dirname(checkpoint_path) + "/config.json"
+    with open(config_file, "r") as f:
+        config = json.load(f)
+        model_args = config["model_args"]
+    # we pre-define some keys to be overriden
+    for k in override_keys:
+        attr = model_args.get(k, None)
+        if attr is not None:
+            setattr(default_model_args, k, attr)
+            print(f"Setting {k} to {attr} as specified in the checkpoint config.")
+    
+    return default_model_args
+
 class InferenceManager:
     def __init__(self, checkpoint_path: str, max_new_tokens=500, device=0, task_filter=None, split_audio: bool = False):
         self.model_args = get_model_args(checkpoint_path)
+        self.model_args = override_args(checkpoint_path, self.model_args)
         self.max_new_tokens = max_new_tokens
         self.device = device
         self.task_filter = task_filter
         self.split_audio = split_audio
-        self.tokenizer = AutoTokenizer.from_pretrained("/mnt/bn/audio-visual-llm-data6/ckpts/Qwen3-8B")
+        self.tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_PATH)
         self.fbank = get_fbank(self.model_args)
         self.model = self._load_model()
 
@@ -30,6 +50,7 @@ class InferenceManager:
             torch_dtype="auto",
             device_map=self.device
         )
+
         model.eval()
         return model
 
@@ -73,3 +94,11 @@ class InferenceManager:
             sample["response"] = cleaned_content
             json.dump(sample, out_file, ensure_ascii=False)
             out_file.write("\n")
+
+if __name__ == "__main__":
+    checkpoint_path = "output/test_stage2_step30000_120s_spear_xlarge_token_mix_bf16_weighted_sum/checkpoint-10000"
+    engine = InferenceManager(checkpoint_path=checkpoint_path, device="cuda")
+    model = engine.model
+    # print(model.audio_encoder_layer_weights)
+    # print(model.audio_encoder_layer_weights.softmax(dim=-1))
+    print("pass")

@@ -71,7 +71,7 @@ if __name__ == "__main__":
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
-    DEFAULT_WRITE_PATH_PARENT = "/mnt/bn/audio-visual-llm-data6/wangsiyin/SALMONN/results"
+    DEFAULT_WRITE_PATH_PARENT = "/mnt/shared-storage-gpfs2/brainllm2-share/xiaoyu/SALMONN/results"
 
     if args.debug:
         args.test_set_path = Path("/mnt/bn/audio-visual-llm-data/datasets/multitask_json/test_debug.json")
