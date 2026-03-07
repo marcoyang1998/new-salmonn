@@ -117,6 +117,7 @@ class MultiKDModel(nn.Module):
         self.encoder_embed = encoder_embed
         self.encoder = encoder
         self.encoder_dim = encoder_dim
+        self.num_encoder_layers = sum(encoder.num_encoder_layers)
             
         self.distillation_layer = distillation_layer
         # the frame ratio between the teacher and student
@@ -237,7 +238,7 @@ class MultiKDModel(nn.Module):
             mask_indices = None
         
         # Compute encoder outputs
-        encoder_out, encoder_out_lens = self.forward_encoder(x, x_lens)
+        encoder_out, encoder_out_lens, middle_out = self.forward_encoder(x, x_lens)
             
         if codebook_indexes is not None and self.codebook_loss_net is not None:
             codebook_loss = self.forward_codebook_loss(
