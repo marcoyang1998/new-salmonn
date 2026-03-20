@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from torch.nn.utils import rnn
 from typing import List, Optional, Tuple, Union
 from transformers.modeling_outputs import CausalLMOutputWithPast
+import os
 import sys
 
 def is_peft_model(model):
@@ -96,7 +97,8 @@ class SALMONN(PreTrainedModel):
             self.audio_encoder = self.get_audio_encoder(model_args)
         if model_args.audio_encoder_path:
             if self.encoder_type == "zipformer2":
-                self.audio_encoder.load_state_dict(torch.load(model_args.audio_encoder_path)["model"], strict=False)
+                info = self.audio_encoder.load_state_dict(torch.load(model_args.audio_encoder_path)["model"], strict=False)
+                print(f"Loading the audio encoder checkpoint from {model_args.audio_encoder_path}, missing keys: {info.missing_keys}, unexpected keys: {info.unexpected_keys}")
         if model_args.freeze_encoder:
             for name, param in self.audio_encoder.named_parameters():
                 param.requires_grad = False
@@ -155,48 +157,76 @@ class SALMONN(PreTrainedModel):
     def _can_record_outputs(self):
         return getattr(self.base_llm, "_can_record_outputs", {})
     
+    def get_zipformer_audio_encoder(self, model_version: str = "xlarge"):
+        from spear_encoder.model import MultiKDModel
+        from spear_encoder.scaling import ScheduledFloat
+        from spear_encoder.subsampling import Conv2dSubsampling
+        # from spear_encoder.zipformer import Zipformer2
+        from spear_encoder.zipformer_layerwise import Zipformer2
+        
+        def _to_int_tuple(s: str):
+            return tuple(map(int, s.split(",")))
+
+        if model_version == "xlarge":
+            model_dim = 1280
+            output_downsampling_factor = 1
+            downsampling_factor = "1,2,4,8,4,2,1"
+            num_encoder_layers = "1,2,3,4,1,1,1"
+            feedforward_dim = "3840,3840,3840,3840,3840,3840,3840"
+            encoder_dim = "1280,1280,1280,1280,1280,1280,1280"
+            encoder_unmasked_dim = "768,768,768,768,768,768,768"
+            cnn_module_kernel = "31,31,15,15,15,31,31"
+            num_heads = "8,8,8,8,8,8,8"
+        elif model_version == "large":
+            model_dim = 1024
+            output_downsampling_factor = 1 
+            downsampling_factor = "1,2,4,8,4,2,1"
+            num_encoder_layers = "1,2,2,3,1,1,1"
+            feedforward_dim = "3072,3072,3072,3072,3072,3072,3072"
+            encoder_dim = "1024,1024,1024,1024,1024,1024,1024"
+            encoder_unmasked_dim = "512,512,512,512,512,512,512"
+            cnn_module_kernel = "31,31,15,15,15,31,31"
+            num_heads = "8,8,8,8,8,8,8"
+        else:
+            raise ValueError("Unsupported model version")
+        
+        encoder_embed = Conv2dSubsampling(
+            in_channels=128,
+            out_channels=model_dim,
+            dropout=ScheduledFloat((0.0, 0.3), (20000.0, 0.1)),
+        )
+
+        encoder = Zipformer2(
+            output_downsampling_factor=output_downsampling_factor,
+            downsampling_factor=_to_int_tuple(downsampling_factor),
+            num_encoder_layers=_to_int_tuple(num_encoder_layers),
+            encoder_dim=_to_int_tuple(encoder_dim),
+            encoder_unmasked_dim=_to_int_tuple(encoder_unmasked_dim),
+            query_head_dim=_to_int_tuple("32"),
+            pos_head_dim=_to_int_tuple("4"),
+            value_head_dim=_to_int_tuple("12"),
+            pos_dim=48,
+            num_heads=_to_int_tuple(num_heads),
+            feedforward_dim=_to_int_tuple(feedforward_dim),
+            cnn_module_kernel=_to_int_tuple(cnn_module_kernel),
+            dropout=ScheduledFloat((0.0, 0.3), (20000.0, 0.1)),
+            warmup_batches=4000.0,
+            causal=False,
+            chunk_size=_to_int_tuple("-1"),
+            left_context_frames=_to_int_tuple("-1"),
+        )
+
+        audio_encoder = MultiKDModel(
+            encoder_embed=encoder_embed,
+            encoder=encoder,
+            encoder_dim=max(_to_int_tuple(encoder_dim)),
+            num_codebooks=0,
+        )
+        return audio_encoder
+    
     def get_audio_encoder(self, model_args):
         if model_args.encoder_type == "zipformer2":
-            from spear_encoder.model import MultiKDModel
-            from spear_encoder.scaling import ScheduledFloat
-            from spear_encoder.subsampling import Conv2dSubsampling
-            # from spear_encoder.zipformer import Zipformer2
-            from spear_encoder.zipformer_layerwise import Zipformer2
-            def _to_int_tuple(s: str):
-                return tuple(map(int, s.split(",")))
-
-            encoder_embed = Conv2dSubsampling(
-                in_channels=128,
-                out_channels=_to_int_tuple("1280,1280,1280,1280,1280,1280,1280")[0],
-                dropout=ScheduledFloat((0.0, 0.3), (20000.0, 0.1)),
-            )
-
-            encoder = Zipformer2(
-                output_downsampling_factor=1,
-                downsampling_factor=_to_int_tuple("1,2,4,8,4,2,1"),
-                num_encoder_layers=_to_int_tuple("1,2,3,4,1,1,1"),
-                encoder_dim=_to_int_tuple("1280,1280,1280,1280,1280,1280,1280"),
-                encoder_unmasked_dim=_to_int_tuple("768,768,768,768,768,768,768"),
-                query_head_dim=_to_int_tuple("32"),
-                pos_head_dim=_to_int_tuple("4"),
-                value_head_dim=_to_int_tuple("12"),
-                pos_dim=48,
-                num_heads=_to_int_tuple("8,8,8,8,8,8,8"),
-                feedforward_dim=_to_int_tuple("3840,3840,3840,3840,3840,3840,3840"),
-                cnn_module_kernel=_to_int_tuple("31,31,15,15,15,31,31"),
-                dropout=ScheduledFloat((0.0, 0.3), (20000.0, 0.1)),
-                warmup_batches=4000.0,
-                causal=False,
-                chunk_size=_to_int_tuple("-1"),
-                left_context_frames=_to_int_tuple("-1"),
-            )
-
-            audio_encoder = MultiKDModel(
-                encoder_embed=encoder_embed,
-                encoder=encoder,
-                encoder_dim=max(_to_int_tuple("1280,1280,1280,1280,1280,1280,1280")),
-                num_codebooks=0,
-            )
+            audio_encoder = self.get_zipformer_audio_encoder(model_args.zipformer_version)
         elif model_args.encoder_type == "dasheng":
             from transformers import AutoModel
 
@@ -447,6 +477,17 @@ class SALMONN(PreTrainedModel):
             return torch.amp.autocast(device_type="cuda",dtype=dtype)
         else:
             return contextlib.nullcontext()
+
+    def _save_last_batch_for_oom(self, input_ids, labels, raw_wavs, audio_paths, texts):
+        dump_path = os.environ.get("SALMONN_OOM_DEBUG_PATH", "./last_oom_batch.pt")
+        payload = {
+            "input_ids": input_ids.detach().cpu() if torch.is_tensor(input_ids) else input_ids,
+            "labels": labels.detach().cpu() if torch.is_tensor(labels) else labels,
+            "raw_wavs": raw_wavs.detach().cpu() if torch.is_tensor(raw_wavs) else raw_wavs,
+            "audio_paths": audio_paths,
+            "texts": texts,
+        }
+        torch.save(payload, dump_path)
     
     def forward(
         self, 
@@ -462,13 +503,31 @@ class SALMONN(PreTrainedModel):
         return_dict = None,
         fbank_feature = None,
         fbank_feature_len = None,
-        raw_wavs = None
+        raw_wavs = None,
+        audio_paths = None,
+        texts = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
+        # import torch.distributed as dist
+        # rank = dist.get_rank()
+        # print(f"Current rank: {rank}, audio paths: {sorted(audio_paths)}")
+        
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+
+        # print(f"Text shape: {input_ids.size()}")
+        # print(f"Input ids: {input_ids}")
+        # print(f"Audio paths: {audio_paths}")
+        # if input_ids.shape[1] >= 1000:
+        #     print("Very long input ids!")
+        #     print(f"Texts: {texts}")
+        #     try:
+        #         self._save_last_batch_for_oom(input_ids, labels, raw_wavs, audio_paths, texts)
+        #     except Exception:
+        #         pass
+        #     assert False, "Input sequence length is too long, may cause OOM. The last batch has been saved for debugging."
 
         input_embeds, attention_mask, labels = self.prepare_inputs_labels_for_speech(
             input_ids, attention_mask, labels, fbank_feature, fbank_feature_len, raw_wavs
