@@ -3,18 +3,56 @@ import json
 from tqdm import tqdm
 import logging
 from inference_manager import InferenceManager
+import argparse
 from argparse import ArgumentParser
 from pathlib import Path
 
 logging.basicConfig(level=logging.ERROR, force=True)
 
-def main(test_set_path, write_path, batch_size, checkpoint_path, max_new_tokens: int = 500, start: int = 0, task_filter: list[str] = None, split_audio: bool = False):
-    inference_manager = InferenceManager(checkpoint_path=checkpoint_path, max_new_tokens=max_new_tokens, task_filter=task_filter, split_audio=split_audio)
+DEFAULT_WRITE_PATH_PARENT = "/mnt/shared-storage-gpfs2/brainllm2-share/xiaoyu/SALMONN/results"
+
+def str2bool(v):
+    """Used in argparse.ArgumentParser.add_argument to indicate
+    that a type is a bool type and user can enter
+
+        - yes, true, t, y, 1, to represent True
+        - no, false, f, n, 0, to represent False
+
+    See https://stackoverflow.com/questions/15008758/parsing-boolean-values-with-argparse  # noqa
+    """
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ("yes", "true", "t", "y", "1"):
+        return True
+    elif v.lower() in ("no", "false", "f", "n", "0"):
+        return False
+    else:
+        raise argparse.ArgumentTypeError("Boolean value expected.")
+
+def main(
+    test_set_path,
+    write_path,
+    batch_size,
+    checkpoint_path,
+    max_new_tokens: int = 500,
+    start: int = 0,
+    task_filter: list[str] = None,
+    split_audio: bool = False,
+    disable_thinking: bool = True,
+):
+    inference_manager = InferenceManager(
+        checkpoint_path=checkpoint_path, 
+        max_new_tokens=max_new_tokens,
+        task_filter=task_filter, 
+        split_audio=split_audio,
+        disable_thinking=disable_thinking,
+    )
 
     with open(test_set_path, "r") as f:
         data = json.load(f)["annotation"]
     
     data = data[start:]
+    print(f"Writing the output to {write_path}.")
     with open(write_path, "a", encoding="utf-8") as out_file:
         batch_data = []
         for i, sample in enumerate(tqdm(data, desc="Inferencing Test Set")):
@@ -64,14 +102,17 @@ if __name__ == "__main__":
     parser.add_argument("--start", type=int, default=0) # start from the last line number in jsonl where it stopped
     parser.add_argument("--tasks_to_infer", nargs="+", type=str, default=default_tasks)
     parser.add_argument("--split_audio", type=bool, default=False)
+    parser.add_argument("--result_folder", type=str, default=DEFAULT_WRITE_PATH_PARENT)
     # REQUIRED settings
     parser.add_argument("--write_path_title", type=str, default = None, required=True)
     parser.add_argument("--checkpoint_path", type=str, default=None, required=True) # it will automatically know which model_argument to use from this
+    # parser.add_argument("--disable_thinking", type='store_true')
+    # If the model is trained explicitly to skip loss on <think>, then it should use --disable_thinking=True
+    # In general disable_thinking can be set to True for all evaluation
+    parser.add_argument("--disable_thinking", type=str2bool, default=True, help="If True, we forced the model to skip thinking")
 
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
-
-    DEFAULT_WRITE_PATH_PARENT = "/mnt/shared-storage-gpfs2/brainllm2-share/xiaoyu/SALMONN/results"
 
     if args.debug:
         args.test_set_path = Path("/mnt/bn/audio-visual-llm-data/datasets/multitask_json/test_debug.json")
@@ -80,8 +121,8 @@ if __name__ == "__main__":
         args.batch_size = 2
         args.worker_num = 1
     
-    write_path = Path(DEFAULT_WRITE_PATH_PARENT) / f"{args.write_path_title}.jsonl"
+    write_path = Path(args.result_folder) / f"{args.write_path_title}.jsonl"
 
     write_path.parent.mkdir(parents = True, exist_ok = True)
 
-    main(args.test_set_path, write_path, args.batch_size, args.checkpoint_path, args.max_new_tokens, start = args.start, task_filter = args.tasks_to_infer, split_audio=args.split_audio)
+    main(args.test_set_path, write_path, args.batch_size, args.checkpoint_path, args.max_new_tokens, start = args.start, task_filter = args.tasks_to_infer, split_audio=args.split_audio, disable_thinking=args.disable_thinking)

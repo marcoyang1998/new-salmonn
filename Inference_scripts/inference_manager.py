@@ -12,7 +12,7 @@ import logging
 from pdb import set_trace as st
 
 TOKENIZER_PATH="/mnt/shared-storage-user/brainllm-share/checkpoints/Qwen3-8B"
-override_keys = ["weighted_sum_encoder", "concat_encoder_features"]
+override_keys = ["weighted_sum_encoder", "concat_encoder_features", "zipformer_version"]
 
 logging.getLogger().setLevel(logging.INFO)
 
@@ -31,7 +31,7 @@ def override_args(checkpoint_path: str, default_model_args):
     return default_model_args
 
 class InferenceManager:
-    def __init__(self, checkpoint_path: str, max_new_tokens=500, device=0, task_filter=None, split_audio: bool = False):
+    def __init__(self, checkpoint_path: str, max_new_tokens=500, device=0, task_filter=None, split_audio: bool = False, disable_thinking: bool=True):
         self.model_args = get_model_args(checkpoint_path)
         self.model_args = override_args(checkpoint_path, self.model_args)
         self.max_new_tokens = max_new_tokens
@@ -41,6 +41,7 @@ class InferenceManager:
         self.tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_PATH)
         self.fbank = get_fbank(self.model_args)
         self.model = self._load_model()
+        self.disable_thinking = disable_thinking
 
     def _load_model(self):
         model = SALMONN.from_pretrained(
@@ -69,7 +70,7 @@ class InferenceManager:
             audio_paths.extend(audio_path_list)
             messages = [{"role": "user", "content": "<audio>" * audio_num + prompt}]
             text = self.tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
+                messages, tokenize=False, add_generation_prompt=True, enable_thinking=not self.disable_thinking,
             )
             texts.append(text)
 
