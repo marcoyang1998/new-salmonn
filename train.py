@@ -26,17 +26,25 @@ class ModelArguments:
     lora_alpha: int = field(default=64)
     lora_dropout: float = field(default=0.05)
     encoder_type: str = field(default="zipformer2")
+    zipformer_version: str = field(default="xlarge")
     audio_encoder_path: str = field(default="/mnt/bn/audio-visual-llm-data6/ckpts/spear-encoder-streaming-600M-speech-only/spear-xlarge-non-streaming/iter-448000-avg-2.pt")
     speech_encoder_path: str = field(default="/mnt/bn/audio-visual-llm-data6/wangsiyin/SALMONN/wavlm")
     freeze_encoder: bool = field(default=True)
     connector_type: str = field(default="MLP")
     connector_seg_size: int = field(default=5)
     connector_hid_size: int = field(default=4096)
+    weighted_sum_encoder: bool = field(default=False)
+    concat_encoder_features: bool = field(default=False)
 
 @dataclass
 class DataArguments:
     data_path: Optional[str] = field(default="")
+    audio_chunk: Optional[int] = field(default=120) # in seconds
     split_audio: bool = field(default=False)
+    shuffle_mc_options: bool = field(default=True)
+    audio_caption_style: Optional[str] = field(default="long") # "long" means we only use the long caption for training, "short" means we only use the short caption for training, "mix" means we randomly sample from both captions during training
+    skip_thinking_loss: bool = field(default=False)
+    broken_sample_max_retries: int = field(default=4)
 
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
@@ -54,7 +62,9 @@ def load_model_and_dataset(model_args, data_args, training_args):
         model_config.attn_implementation = model_args.attn_implementation
         model = SALMONN(model_config, model_args)
     else:
-        tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path)
+        tokenizer = AutoTokenizer.from_pretrained(
+            model_args.model_name_or_path,
+        )
         model_config = AutoConfig.from_pretrained(os.path.join(model_args.model_name_or_path,"config.json"))
         model = SALMONN.from_pretrained(
             model_args.model_name_or_path,
@@ -104,7 +114,7 @@ def main():
                 raw_wav = pad_sequence(raw_wav, batch_first=True)
             fbank_feature_len = torch.tensor(fbank_feature_len)
             
-            return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels, "fbank_feature": fbank_feature, "fbank_feature_len": fbank_feature_len, "raw_wavs": raw_wav}
+            return {"input_ids": input_ids, "attention_mask": attention_mask, "labels": labels, "fbank_feature": fbank_feature, "fbank_feature_len": fbank_feature_len, "raw_wavs": raw_wav, "audio_paths": [s["audio_paths"] for s in samples], "texts": [s["texts"] for s in samples]}
         
     collator = Collator()
 
@@ -122,6 +132,15 @@ def main():
     else:
         trainer.train()
 
+    # import pdb; pdb.set_trace()
+    # import torch.distributed as dist
+    # print(
+    #     "effective batch =",
+    #     training_args.per_device_train_batch_size
+    #     * training_args.gradient_accumulation_steps
+    #     * dist.get_world_size()
+    # )
+    
     # Save model and training state
     trainer.save_state()
     torch.cuda.synchronize()
