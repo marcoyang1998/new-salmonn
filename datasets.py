@@ -65,7 +65,12 @@ class SALMONN_Dataset(Dataset):
         raw_wavs = []
         audio_nums = []
         for audio_path in sample["audios"]:
-            audio, fs = torchaudio.load(audio_path, num_frames=self.max_frames)
+            audio, fs = torchaudio.load(audio_path)
+            # some of our audio is not 16k hz, so we first resample them and then truncate it
+            if fs != 16000:
+                audio = torchaudio.functional.resample(audio, fs, 16000)
+                fs = 16000
+            audio = audio[:, :self.max_frames]
             assert fs == 16000
             if self.encoder_type == "zipformer2":
                 if self.split_audio:
