@@ -117,6 +117,7 @@ class MultiKDModel(nn.Module):
         self.encoder_embed = encoder_embed
         self.encoder = encoder
         self.encoder_dim = encoder_dim
+        self.num_encoder_layers = sum(encoder.num_encoder_layers)
             
         self.distillation_layer = distillation_layer
         # the frame ratio between the teacher and student
@@ -161,6 +162,11 @@ class MultiKDModel(nn.Module):
         
         self.loss_only_mask = loss_only_mask
 
+    def forward_one_chunk(
+        self, x: torch.Tensor, x_lens: torch.Tensor,
+    ):
+        pass
+    
     def forward_encoder(
         self, x: torch.Tensor, x_lens: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -185,12 +191,12 @@ class MultiKDModel(nn.Module):
         src_key_padding_mask = make_pad_mask(x_lens)
         x = x.permute(1, 0, 2)  # (N, T, C) -> (T, N, C)
 
-        encoder_out, encoder_out_lens = self.encoder(x, x_lens, src_key_padding_mask)
+        encoder_out, encoder_out_lens, middle_out = self.encoder(x, x_lens, src_key_padding_mask, return_middle_out=True)
 
         encoder_out = encoder_out.permute(1, 0, 2)  # (T, N, C) ->(N, T, C)
         assert torch.all(encoder_out_lens > 0), (x_lens, encoder_out_lens)
 
-        return encoder_out, encoder_out_lens
+        return encoder_out, encoder_out_lens, middle_out
 
     def forward(
         self,
@@ -232,7 +238,7 @@ class MultiKDModel(nn.Module):
             mask_indices = None
         
         # Compute encoder outputs
-        encoder_out, encoder_out_lens = self.forward_encoder(x, x_lens)
+        encoder_out, encoder_out_lens, middle_out = self.forward_encoder(x, x_lens)
             
         if codebook_indexes is not None and self.codebook_loss_net is not None:
             codebook_loss = self.forward_codebook_loss(
