@@ -82,6 +82,8 @@ class SALMONN(PreTrainedModel):
             )
             self.base_llm = get_peft_model(self.base_llm, peft_config)
         
+        self.concat_encoder_features = getattr(model_args, "concat_encoder_features", False)
+        
         if self.encoder_type == "dasheng_wavlm":
             self.audio_encoder, self.speech_encoder = self.get_audio_encoder(model_args)
             self.fbank = AutoFeatureExtractor.from_pretrained("/mnt/bn/audio-visual-llm-data6/wangsiyin/SALMONN/dasheng", trust_remote_code=True)
@@ -105,6 +107,11 @@ class SALMONN(PreTrainedModel):
                 self.speech_encoder.eval()
         if self.encoder_type == "zipformer2":
             encoder_dim = self.audio_encoder.encoder_dim
+            num_encoder_layers = sum(self.audio_encoder.encoder.num_encoder_layers)
+            if self.concat_encoder_features:
+                # assert not self.weighted_sum_encoder, "Cannot concat encoder features when using weighted sum"
+                num_encoder_layers = self.audio_encoder.num_encoder_layers
+                self.concat_proj = nn.Linear(int(num_encoder_layers * encoder_dim), encoder_dim)
             self.ln_audio = nn.LayerNorm(encoder_dim)
         elif self.encoder_type == "dasheng":
             encoder_dim = self.audio_encoder.config.encoder_kwargs["embed_dim"]
@@ -149,7 +156,8 @@ class SALMONN(PreTrainedModel):
             from spear_encoder.model import MultiKDModel
             from spear_encoder.scaling import ScheduledFloat
             from spear_encoder.subsampling import Conv2dSubsampling
-            from spear_encoder.zipformer import Zipformer2
+            # from spear_encoder.zipformer import Zipformer2
+            from spear_encoder.zipformer_layerwise import Zipformer2
             def _to_int_tuple(s: str):
                 return tuple(map(int, s.split(",")))
 
@@ -247,10 +255,16 @@ class SALMONN(PreTrainedModel):
     def encode_audio(self, fbank_feature, fbank_feature_len, raw_wavs):
         with self.maybe_autocast(next(self.audio_encoder.parameters()).dtype):
             if self.encoder_type == "zipformer2":
-                audio_embeds, encoder_out_lens = self.audio_encoder.forward_encoder(
+                audio_embeds, encoder_out_lens, middle_out = self.audio_encoder.forward_encoder(
                     fbank_feature[:,:max(fbank_feature_len),:],
                     fbank_feature_len
                 )
+                if self.concat_encoder_features:
+                    # assert not self.weighted_sum_encoder
+                    # NOTE: maybe this layer norm is not necessary, but we keep it this way for now
+                    middle_out = [F.layer_norm(m.permute(1,0,2), (m.shape[-1],)) for m in middle_out]
+                    middle_out = torch.cat(middle_out, dim=-1) # (N,T,num_layers * C)
+                    audio_embeds = self.concat_proj(middle_out) # (N,T,C)
                 audio_embeds = self.ln_audio(audio_embeds)
             elif self.encoder_type == "dasheng":
                 audio_embeds = self.audio_encoder(fbank_feature.transpose(1, 2)).hidden_states
