@@ -9,18 +9,56 @@ import json
 from tqdm import tqdm
 from inference_utils import get_prompt, get_audio_path_list, extract_audio_features, get_fbank, prepare_model_inputs, get_model_args
 import logging
-from pdb import set_trace as st
+
+TOKENIZER_PATH="/mnt/shared-storage-gpfs2/brainllm2-share/xiaoyu/models/Qwen3-8B"
+
+override_keys = [
+    "weighted_sum_encoder",
+    "concat_encoder_features",
+    "zipformer_version",
+    "connector_hid_size",
+    "connector_seg_size",
+    "connector_type"
+]
+
+def override_args(checkpoint_path: str, default_model_args):
+    config_file = os.path.dirname(checkpoint_path) + "/config.json"
+    if not os.path.exists(config_file):
+        logging.warning(f"Config file {config_file} not found. Using default model args without override.")
+        return default_model_args
+    with open(config_file, "r") as f:
+        config = json.load(f)
+        model_args = config["model_args"]
+    # we pre-define some keys to be overriden
+    for k in override_keys:
+        attr = model_args.get(k, None)
+        if attr is not None:
+            setattr(default_model_args, k, attr)
+            print(f"Setting {k} to {attr} as specified in the checkpoint config.")
+    
+    return default_model_args
 
 class InferenceManager:
-    def __init__(self, checkpoint_path: str, max_new_tokens=500, device=0, task_filter=None, split_audio: bool = False):
+    def __init__(
+        self,
+        checkpoint_path: str,
+        max_new_tokens=500,
+        device=0,
+        task_filter=None,
+        split_audio: bool = False,
+        disable_thinking: bool=True,
+        tokenizer_path: str = TOKENIZER_PATH
+    ):
         self.model_args = get_model_args(checkpoint_path)
+        self.model_args = override_args(checkpoint_path, self.model_args)
         self.max_new_tokens = max_new_tokens
         self.device = device
         self.task_filter = task_filter
         self.split_audio = split_audio
-        self.tokenizer = AutoTokenizer.from_pretrained("/mnt/bn/audio-visual-llm-data6/ckpts/Qwen3-8B")
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
         self.fbank = get_fbank(self.model_args)
         self.model = self._load_model()
+        self.disable_thinking = disable_thinking
 
     def _load_model(self):
         model = SALMONN.from_pretrained(
@@ -48,7 +86,7 @@ class InferenceManager:
             audio_paths.extend(audio_path_list)
             messages = [{"role": "user", "content": "<audio>" * audio_num + prompt}]
             text = self.tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
+                messages, tokenize=False, add_generation_prompt=True, enable_thinking=not self.disable_thinking,
             )
             texts.append(text)
 

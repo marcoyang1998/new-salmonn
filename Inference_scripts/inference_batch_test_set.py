@@ -1,3 +1,4 @@
+import argparse
 import os
 import json
 from tqdm import tqdm
@@ -6,10 +7,48 @@ from inference_manager import InferenceManager
 from argparse import ArgumentParser
 from pathlib import Path
 
+TOKENIZER_PATH="/mnt/shared-storage-gpfs2/brainllm2-share/xiaoyu/models/Qwen3-8B"
+
 logging.basicConfig(level=logging.ERROR, force=True)
 
-def main(test_set_path, write_path, batch_size, checkpoint_path, max_new_tokens: int = 500, start: int = 0, task_filter: list[str] = None, split_audio: bool = False):
-    inference_manager = InferenceManager(checkpoint_path=checkpoint_path, max_new_tokens=max_new_tokens, task_filter=task_filter, split_audio=split_audio)
+def str2bool(v):
+    """Used in argparse.ArgumentParser.add_argument to indicate
+    that a type is a bool type and user can enter
+
+        - yes, true, t, y, 1, to represent True
+        - no, false, f, n, 0, to represent False
+
+    See https://stackoverflow.com/questions/15008758/parsing-boolean-values-with-argparse  # noqa
+    """
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ("yes", "true", "t", "y", "1"):
+        return True
+    elif v.lower() in ("no", "false", "f", "n", "0"):
+        return False
+    else:
+        raise argparse.ArgumentTypeError("Boolean value expected.")
+
+def main(
+    test_set_path,
+    write_path,
+    batch_size,
+    checkpoint_path,
+    max_new_tokens: int = 500,
+    start: int = 0,
+    task_filter: list[str] = None,
+    split_audio: bool = False,
+    disable_thinking: bool = True,
+    tokenizer_path: str = None,
+):
+    inference_manager = InferenceManager(
+        checkpoint_path=checkpoint_path,
+        max_new_tokens=max_new_tokens,
+        task_filter=task_filter,
+        split_audio=split_audio,
+        disable_thinking=disable_thinking,
+        tokenizer_path=tokenizer_path
+    )
 
     with open(test_set_path, "r") as f:
         data = json.load(f)["annotation"]
@@ -67,11 +106,13 @@ if __name__ == "__main__":
     # REQUIRED settings
     parser.add_argument("--write_path_title", type=str, default = None, required=True)
     parser.add_argument("--checkpoint_path", type=str, default=None, required=True) # it will automatically know which model_argument to use from this
+    parser.add_argument("--disable_thinking", type=str2bool, default=True, help="If True, we forced the model to skip thinking")
+    parser.add_argument("--tokenizer_path", type=str, default=TOKENIZER_PATH)
 
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
-    DEFAULT_WRITE_PATH_PARENT = "/mnt/bn/audio-visual-llm-data6/wangsiyin/SALMONN/results"
+    DEFAULT_WRITE_PATH_PARENT = "/mnt/shared-storage-gpfs2/brainllm2-share/xiaoyu/SALMONN_wenyi/results"
 
     if args.debug:
         args.test_set_path = Path("/mnt/bn/audio-visual-llm-data/datasets/multitask_json/test_debug.json")
@@ -84,4 +125,15 @@ if __name__ == "__main__":
 
     write_path.parent.mkdir(parents = True, exist_ok = True)
 
-    main(args.test_set_path, write_path, args.batch_size, args.checkpoint_path, args.max_new_tokens, start = args.start, task_filter = args.tasks_to_infer, split_audio=args.split_audio)
+    main(
+        args.test_set_path,
+        write_path,
+        args.batch_size,
+        args.checkpoint_path,
+        args.max_new_tokens,
+        start = args.start,
+        task_filter = args.tasks_to_infer,
+        split_audio=args.split_audio,
+        disable_thinking=args.disable_thinking,
+        tokenizer_path=args.tokenizer_path,
+    )

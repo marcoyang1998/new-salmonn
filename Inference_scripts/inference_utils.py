@@ -12,7 +12,7 @@ max_frames = 120 * 16000
 def get_prompt(sample: dict) -> str:
     task = sample["task"]
     
-    if task in ["gender_QA", "QA"]:
+    if task in ["gender_QA", "QA", "MC_QA"]:
         prompt_template = "{}"
         return prompt_template.format(sample.get("Q", ""))
     elif task == "slot_filling":
@@ -48,6 +48,12 @@ def get_prompt(sample: dict) -> str:
         base_prompt = prompts.get(task, "Please process the audio.")
         return base_prompt
 
+def get_MC_template(sample: dict) -> str:
+    question = sample.get("Q", "")
+    options = sample.get("options", [])
+    options_text = " ".join([f"{chr(65+i)}. {option}" for i, option in enumerate(options)])
+    return f"{question} {options_text}"
+
 def get_audio_path_list(sample: dict) -> list[str]:
     audio_path_list = [sample["path"]]
     if "expand_wav" in sample.keys():
@@ -60,8 +66,11 @@ def extract_audio_features(audio_paths: list[str], fbank: Fbank, model, model_ar
     audio_nums = []
     feature_lens = []
     for audio_path in audio_paths:
-        audio, fs = torchaudio.load(audio_path, num_frames=max_frames)
-        assert fs == 16000
+        audio, fs = torchaudio.load(audio_path)
+        if fs != 16000:
+            audio = torchaudio.functional.resample(audio, fs, 16000)
+            fs = 16000
+        audio = audio[:, :max_frames]
 
         if model_args.encoder_type == "zipformer2":
             if split_audio:
@@ -240,7 +249,7 @@ def get_model_args(checkpoint_path: str):
             connector_seg_size: int = 5
             connector_hid_size: int = 6400
 
-    elif "qwen3" in checkpoint_path:
+    elif "qwen3" in checkpoint_path and "omni" in checkpoint_path:
         class ModelArguments:
             model_name_or_path: str = checkpoint_path
             base_llm_path: str = ""
@@ -258,7 +267,7 @@ def get_model_args(checkpoint_path: str):
             connector_seg_size: int = 5
             connector_hid_size: int = 8192
 
-    elif "qwen" in checkpoint_path:
+    elif "qwen" in checkpoint_path and "omni" in checkpoint_path:
         class ModelArguments:
             model_name_or_path: str = checkpoint_path
             base_llm_path: str = ""
@@ -346,5 +355,7 @@ def get_model_args(checkpoint_path: str):
             connector_type: str = "MLP"
             connector_seg_size: int = 5
             connector_hid_size: int = 4096
+            concat_encoder_features: bool = False
+            zipformer_version: str = "xlarge"
 
     return ModelArguments()
