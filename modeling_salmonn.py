@@ -8,6 +8,8 @@ from typing import List, Optional, Tuple, Union
 from transformers.modeling_outputs import CausalLMOutputWithPast
 import sys
 
+BERT_CKPT="/mnt/shared-storage-gpfs2/brainllm2-share/xiaoyu/models/google-bert--bert-base-uncased"
+
 def is_peft_model(model):
     return getattr(model, "peft_config", None) is not None
 
@@ -96,7 +98,8 @@ class SALMONN(PreTrainedModel):
             self.audio_encoder = self.get_audio_encoder(model_args)
         if model_args.audio_encoder_path:
             if self.encoder_type == "zipformer2":
-                self.audio_encoder.load_state_dict(torch.load(model_args.audio_encoder_path)["model"], strict=False)
+                info = self.audio_encoder.load_state_dict(torch.load(model_args.audio_encoder_path)["model"], strict=False)
+                print(f"Loading info: {info}")
         if model_args.freeze_encoder:
             for name, param in self.audio_encoder.named_parameters():
                 param.requires_grad = False
@@ -139,6 +142,7 @@ class SALMONN(PreTrainedModel):
             encoder_dim = self.audio_encoder.config.d_model
             self.ln_audio = nn.LayerNorm(encoder_dim)
 
+        self.connector_type = model_args.connector_type
         if model_args.connector_type == "MLP":
             self.connector_seg_size = model_args.connector_seg_size
             self.connector_hid_size = model_args.connector_hid_size
@@ -147,6 +151,62 @@ class SALMONN(PreTrainedModel):
                 nn.ReLU(),
                 nn.Linear(self.connector_hid_size, config.hidden_size)
             )
+        elif model_args.connector_type == "Qformer":
+            # TODO: make the following adjustable
+            self.num_speech_query_token = getattr(model_args, "num_speech_query_token", 1) 
+            self.second_per_window = getattr(model_args, "second_per_window", 0.333333)
+            self.second_stride = getattr(model_args, "second_stride", 0.333333)
+            
+            encoder_dim = self.audio_encoder.encoder_dim # TODO: adjust for other audio encoder, currently only support SPEAR
+            self.speech_Qformer, self.speech_query_tokens = self.init_speech_Qformer(
+                num_query_token=self.num_speech_query_token, speech_width=encoder_dim
+            )
+            self.speech_Qformer.bert.embeddings.word_embeddings = None
+            self.speech_Qformer.bert.embeddings.position_embeddings = None
+            for layer in self.speech_Qformer.bert.encoder.layer:
+                layer.output = None
+                layer.intermediate = None
+            self.speech_Qformer.cls = None
+            # Patch get_output_embeddings so that tie_weights() during from_pretrained()
+            # does not crash when cls is None.
+            self.speech_Qformer.get_output_embeddings = lambda: None
+            
+            freeze_speech_QFormer = getattr(model_args, "freeze_speech_QFormer", False)
+            if freeze_speech_QFormer:
+                for name, param in self.speech_Qformer.named_parameters():
+                    param.requires_grad = False
+                self.speech_Qformer.eval()
+                self.speech_query_tokens.requires_grad = False
+                print("freeze Speech QFormer")
+            
+            self.post_qformer_proj = nn.Linear(
+                self.speech_Qformer.config.hidden_size, config.hidden_size
+            )
+            freeze_post_qformer_proj = getattr(model_args, "freeze_post_qformer_proj", False)
+            if freeze_post_qformer_proj:
+                for name, param in self.post_qformer_proj.named_parameters():
+                    param.requires_grad = False
+                self.post_qformer_proj.eval()
+                print("freeze post QFormer proj")
+        else:
+            raise ValueError(f"Unsupported connector type: {model_args.connector_type}")
+    
+    @classmethod
+    def init_speech_Qformer(cls, num_query_token, speech_width, num_hidden_layers=2):
+        from models.Qformer import BertConfig, BertLMHeadModel
+        encoder_config = BertConfig.from_pretrained(BERT_CKPT)
+        encoder_config.num_hidden_layers = num_hidden_layers
+        encoder_config.encoder_width = speech_width
+        # insert cross-attention layer every other block
+        encoder_config.add_cross_attention = True
+        encoder_config.cross_attention_freq = 1
+        encoder_config.query_length = num_query_token
+        Qformer = BertLMHeadModel(config=encoder_config)
+        query_tokens = nn.Parameter(
+            torch.zeros(1, num_query_token, encoder_config.hidden_size)
+        )
+        query_tokens.data.normal_(mean=0.0, std=encoder_config.initializer_range)
+        return Qformer, query_tokens
     
     def _can_record_outputs(self):
         return getattr(self.base_llm, "_can_record_outputs", {})
@@ -157,7 +217,11 @@ class SALMONN(PreTrainedModel):
             from spear_encoder.scaling import ScheduledFloat
             from spear_encoder.subsampling import Conv2dSubsampling
             # from spear_encoder.zipformer import Zipformer2
-            from spear_encoder.zipformer_layerwise import Zipformer2
+            encoder_lora = getattr(model_args, "encoder_lora", False)
+            if encoder_lora:
+                from spear_encoder.zipformer_lora import Zipformer2
+            else:
+                from spear_encoder.zipformer_layerwise import Zipformer2
             def _to_int_tuple(s: str):
                 return tuple(map(int, s.split(",")))
 
@@ -166,26 +230,62 @@ class SALMONN(PreTrainedModel):
                 out_channels=_to_int_tuple("1280,1280,1280,1280,1280,1280,1280")[0],
                 dropout=ScheduledFloat((0.0, 0.3), (20000.0, 0.1)),
             )
+            if encoder_lora:
+                encoder = Zipformer2(
+                    output_downsampling_factor=1,
+                    downsampling_factor=_to_int_tuple("1,2,4,8,4,2,1"),
+                    num_encoder_layers=_to_int_tuple("1,2,3,4,1,1,1"),
+                    encoder_dim=_to_int_tuple("1280,1280,1280,1280,1280,1280,1280"),
+                    encoder_unmasked_dim=_to_int_tuple("768,768,768,768,768,768,768"),
+                    query_head_dim=_to_int_tuple("32"),
+                    pos_head_dim=_to_int_tuple("4"),
+                    value_head_dim=_to_int_tuple("12"),
+                    pos_dim=48,
+                    num_heads=_to_int_tuple("8,8,8,8,8,8,8"),
+                    feedforward_dim=_to_int_tuple("3840,3840,3840,3840,3840,3840,3840"),
+                    cnn_module_kernel=_to_int_tuple("31,31,15,15,15,31,31"),
+                    dropout=ScheduledFloat((0.0, 0.3), (20000.0, 0.1)),
+                    warmup_batches=4000.0,
+                    causal=False,
+                    chunk_size=_to_int_tuple("-1"),
+                    left_context_frames=_to_int_tuple("-1"),
+                    use_lora=model_args.encoder_lora,
+                    lora_r=model_args.encoder_lora_rank,
+                )
+                num_param = sum([p.numel() for p in encoder.parameters()])
+                num_trainable = 0
+                for name, p in encoder.named_parameters():
+                    if "lora_A" in name or "lora_B" in name:
+                        p.requires_grad = True
+                        num_trainable += p.numel()
+                    else:
+                        p.requires_grad = False
 
-            encoder = Zipformer2(
-                output_downsampling_factor=1,
-                downsampling_factor=_to_int_tuple("1,2,4,8,4,2,1"),
-                num_encoder_layers=_to_int_tuple("1,2,3,4,1,1,1"),
-                encoder_dim=_to_int_tuple("1280,1280,1280,1280,1280,1280,1280"),
-                encoder_unmasked_dim=_to_int_tuple("768,768,768,768,768,768,768"),
-                query_head_dim=_to_int_tuple("32"),
-                pos_head_dim=_to_int_tuple("4"),
-                value_head_dim=_to_int_tuple("12"),
-                pos_dim=48,
-                num_heads=_to_int_tuple("8,8,8,8,8,8,8"),
-                feedforward_dim=_to_int_tuple("3840,3840,3840,3840,3840,3840,3840"),
-                cnn_module_kernel=_to_int_tuple("31,31,15,15,15,31,31"),
-                dropout=ScheduledFloat((0.0, 0.3), (20000.0, 0.1)),
-                warmup_batches=4000.0,
-                causal=False,
-                chunk_size=_to_int_tuple("-1"),
-                left_context_frames=_to_int_tuple("-1"),
-            )
+                print(
+                    "A total of {} trainable parameters ({:.3f}% of the audio encoder)".format(
+                        num_trainable, num_trainable / num_param * 100
+                    )
+                )
+            else:
+                encoder = Zipformer2(
+                    output_downsampling_factor=1,
+                    downsampling_factor=_to_int_tuple("1,2,4,8,4,2,1"),
+                    num_encoder_layers=_to_int_tuple("1,2,3,4,1,1,1"),
+                    encoder_dim=_to_int_tuple("1280,1280,1280,1280,1280,1280,1280"),
+                    encoder_unmasked_dim=_to_int_tuple("768,768,768,768,768,768,768"),
+                    query_head_dim=_to_int_tuple("32"),
+                    pos_head_dim=_to_int_tuple("4"),
+                    value_head_dim=_to_int_tuple("12"),
+                    pos_dim=48,
+                    num_heads=_to_int_tuple("8,8,8,8,8,8,8"),
+                    feedforward_dim=_to_int_tuple("3840,3840,3840,3840,3840,3840,3840"),
+                    cnn_module_kernel=_to_int_tuple("31,31,15,15,15,31,31"),
+                    dropout=ScheduledFloat((0.0, 0.3), (20000.0, 0.1)),
+                    warmup_batches=4000.0,
+                    causal=False,
+                    chunk_size=_to_int_tuple("-1"),
+                    left_context_frames=_to_int_tuple("-1"),
+                )
 
             audio_encoder = MultiKDModel(
                 encoder_embed=encoder_embed,
@@ -333,33 +433,82 @@ class SALMONN(PreTrainedModel):
                 audio_embeds = encoder_outputs.last_hidden_state
                 audio_embeds = self.ln_audio(audio_embeds)
 
-            bsz, seqlen, ndim = audio_embeds.size()
-            if seqlen % self.connector_seg_size != 0:
-                pad_embeds = torch.zeros(
-                    (bsz, (seqlen // self.connector_seg_size + 1) * self.connector_seg_size - seqlen, ndim), dtype=audio_embeds.dtype, device=audio_embeds.device
-                )
-                audio_embeds = torch.cat((audio_embeds, pad_embeds), dim=1)
-                bsz, seqlen, ndim = audio_embeds.size()
+            if self.connector_type == "Qformer":
+                assert self.encoder_type == "zipformer2"
+                audio_embeds, audio_atts = self.forward_qformer(audio_embeds, audio_embeds_lens=encoder_out_lens)
+                audio_embeds_len = torch.ceil(encoder_out_lens / 50) * 3
+                audio_embeds_len = torch.clamp(audio_embeds_len, max=audio_embeds.shape[1])
+                return audio_embeds, audio_embeds_len.to(torch.int64)
             
-            audio_embeds = audio_embeds.view(bsz, seqlen // self.connector_seg_size, ndim * self.connector_seg_size)
-            audio_embeds = self.connector(audio_embeds)
+            # this is for MLP connnector
+            elif self.connector_type == "MLP":
+                bsz, seqlen, ndim = audio_embeds.size()
+                if seqlen % self.connector_seg_size != 0:
+                    pad_embeds = torch.zeros(
+                        (bsz, (seqlen // self.connector_seg_size + 1) * self.connector_seg_size - seqlen, ndim), dtype=audio_embeds.dtype, device=audio_embeds.device
+                    )
+                    audio_embeds = torch.cat((audio_embeds, pad_embeds), dim=1)
+                    bsz, seqlen, ndim = audio_embeds.size()
+                
+                audio_embeds = audio_embeds.view(bsz, seqlen // self.connector_seg_size, ndim * self.connector_seg_size)
+                audio_embeds = self.connector(audio_embeds)
 
-            if self.encoder_type == "zipformer2":
-                return audio_embeds, torch.ceil(encoder_out_lens/self.connector_seg_size).to(torch.int64)
-            elif self.encoder_type == "dasheng":
-                return audio_embeds, torch.ceil(fbank_feature_len/(4*self.connector_seg_size)).to(torch.int64)
-            elif self.encoder_type == "dasheng_wavlm":
-                return audio_embeds, torch.ceil(fbank_feature_len/(640*self.connector_seg_size)).to(torch.int64)
-            elif self.encoder_type == "whisper_beats" or self.encoder_type == "whisper":
-                return audio_embeds, [300] * bsz
-            elif self.encoder_type == "qwenomni" or self.encoder_type == "qwen3omni":
-                return audio_embeds, torch.ceil(audio_output_lengths/self.connector_seg_size).to(torch.int64)
-            elif self.encoder_type == "mimo":
-                return audio_embeds, torch.ceil(encoder_output_length/self.connector_seg_size).to(torch.int64)
-            elif self.encoder_type == "perception_av":
-                return audio_embeds, torch.ceil(encoder_output_length/self.connector_seg_size).to(torch.int64)
-            elif self.encoder_type == "audio_flamingo":
-                return audio_embeds, torch.ceil(fbank_feature_len/(4*self.connector_seg_size)).to(torch.int64)
+                if self.encoder_type == "zipformer2":
+                    return audio_embeds, torch.ceil(encoder_out_lens/self.connector_seg_size).to(torch.int64)
+                elif self.encoder_type == "dasheng":
+                    return audio_embeds, torch.ceil(fbank_feature_len/(4*self.connector_seg_size)).to(torch.int64)
+                elif self.encoder_type == "dasheng_wavlm":
+                    return audio_embeds, torch.ceil(fbank_feature_len/(640*self.connector_seg_size)).to(torch.int64)
+                elif self.encoder_type == "whisper_beats" or self.encoder_type == "whisper":
+                    return audio_embeds, [300] * bsz
+                elif self.encoder_type == "qwenomni" or self.encoder_type == "qwen3omni":
+                    return audio_embeds, torch.ceil(audio_output_lengths/self.connector_seg_size).to(torch.int64)
+                elif self.encoder_type == "mimo":
+                    return audio_embeds, torch.ceil(encoder_output_length/self.connector_seg_size).to(torch.int64)
+                elif self.encoder_type == "perception_av":
+                    return audio_embeds, torch.ceil(encoder_output_length/self.connector_seg_size).to(torch.int64)
+                elif self.encoder_type == "audio_flamingo":
+                    return audio_embeds, torch.ceil(fbank_feature_len/(4*self.connector_seg_size)).to(torch.int64)       
+    
+    def forward_qformer(self, audio_embeds, audio_embeds_lens=None):
+        assert self.connector_type == "Qformer", "forward_qformer only works when connector_type is Qformer"
+        with self.maybe_autocast():
+            # skip pre-norm because we already have the layer norm    
+            if audio_embeds_lens is not None:
+                audio_atts = torch.arange(audio_embeds.size(1)).unsqueeze(0).to(audio_embeds.device) < audio_embeds_lens.unsqueeze(1)
+            else:
+                audio_atts = torch.ones(audio_embeds.size()[:-1], dtype=torch.long).to(audio_embeds.device)
+
+            if True or self.window_level_Qformer: # TODO: currently we always use window-level Qformer, because we find that frame-level Qformer does not perform well, we will further investigate this issue in the future
+                B, T, C = audio_embeds.shape
+                # kernel = round(1500 * self.second_per_window / 30.0)
+                kernel = round(self.second_per_window * 50) # TODO: make the frame-rate an attribute
+                stride = round(self.second_stride * 50) # TODO: make the frame-rate an attribute
+                kernel = (1, kernel)
+                stride = (1, stride)
+                audio_embeds_tr = audio_embeds.transpose(1, 2).unsqueeze(2)
+                audio_embeds_overlap = F.unfold(audio_embeds_tr, kernel_size=kernel, dilation=1, padding=0, stride=stride)
+                _, _, L = audio_embeds_overlap.shape
+                audio_embeds_overlap = audio_embeds_overlap.view(B, -1, kernel[1], L)
+                audio_embeds_overlap = torch.permute(audio_embeds_overlap, [0, 3, 2, 1])
+                audio_embeds = audio_embeds_overlap.reshape(-1, kernel[1], C)
+                audio_atts = torch.ones(audio_embeds.size()[:-1], dtype=torch.long, device=audio_embeds.device)
+
+            query_tokens = self.speech_query_tokens.expand(audio_embeds.shape[0], -1, -1)
+            query_output = self.speech_Qformer.bert(
+                query_embeds=query_tokens,
+                encoder_hidden_states=audio_embeds,
+                encoder_attention_mask=audio_atts,
+                return_dict=True,
+            )
+            audio_embeds = self.post_qformer_proj(query_output.last_hidden_state)
+
+            if True or self.window_level_Qformer:
+                audio_embeds = audio_embeds.view(B, -1, audio_embeds.size(2)).contiguous()
+
+            audio_atts = torch.ones(audio_embeds.size()[:-1], dtype=torch.long).to(audio_embeds.device)
+
+        return audio_embeds, audio_atts
     
     def _get_feat_extract_output_lengths(self, input_lengths):
         input_lengths_leave = input_lengths % 100
