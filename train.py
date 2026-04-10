@@ -10,7 +10,7 @@ logging.basicConfig(level=logging.WARNING, force=True)
 import torch
 from torch.nn.utils.rnn import pad_sequence
 import transformers
-from transformers import AutoConfig, AutoTokenizer, Trainer
+from transformers import AutoConfig, AutoTokenizer, Trainer, TrainerCallback
 
 from modeling_salmonn import SALMONN
 from datasets import SALMONN_Dataset
@@ -32,11 +32,20 @@ class ModelArguments:
     connector_type: str = field(default="MLP")
     connector_seg_size: int = field(default=5)
     connector_hid_size: int = field(default=4096)
+    concat_encoder_features: bool = field(default=False)
+    encoder_lora: bool = field(default=False)
+    encoder_lora_rank: int = field(default=16)
 
 @dataclass
 class DataArguments:
     data_path: Optional[str] = field(default="")
     split_audio: bool = field(default=False)
+    audio_chunk: int = field(default=60, metadata={"help": "Audio chunk size in seconds when split_audio is True."})
+    max_audio_duration: float = field(
+        default=-1,
+        metadata={"help": "Maximum audio duration in seconds. Entries with any audio longer than this are "
+                          "removed. -1 (default) disables filtering."},
+    )
 
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
@@ -45,6 +54,11 @@ class TrainingArguments(transformers.TrainingArguments):
 
     min_learning_rate: Optional[float] = field(default=None)
     from_scratch: bool = field(default=False)
+    encoder_lr_ratio: Optional[float] = field(
+        default=None,
+        metadata={"help": "LR multiplier for the audio encoder parameters (e.g. 0.1 = 1/10 of base LR). "
+                          "Only effective when freeze_encoder=False."},
+    )
 
 def load_model_and_dataset(model_args, data_args, training_args):
     if training_args.from_scratch:
@@ -108,13 +122,69 @@ def main():
         
     collator = Collator()
 
-    trainer = Trainer(
+    class LRLoggingCallback(TrainerCallback):
+        """Logs per-param-group learning rates every logging step."""
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            if self.trainer is None or not hasattr(self.trainer, "optimizer") or self.trainer.optimizer is None:
+                return
+            for i, group in enumerate(self.trainer.optimizer.param_groups):
+                key = f"lr_group_{i}"
+                current_lr = group["lr"]
+                if logs is not None:
+                    logs[key] = current_lr
+                print(f"  [LR] param_group[{i}]: {current_lr:.3e}")
+
+        def set_trainer(self, trainer):
+            self.trainer = trainer
+
+    lr_callback = LRLoggingCallback()
+
+    class SALMONNTrainer(Trainer):
+        """Trainer subclass that supports a separate (lower) LR for the audio encoder."""
+
+        def create_optimizer(self):
+            encoder_lr_ratio = self.args.encoder_lr_ratio
+            if encoder_lr_ratio is None or encoder_lr_ratio == 1.0 or model_args.freeze_encoder:
+                return super().create_optimizer()
+
+            base_lr = self.args.learning_rate
+            encoder_lr = base_lr * encoder_lr_ratio
+
+            encoder_params = []
+            other_params = []
+            for name, param in self.model.named_parameters():
+                if not param.requires_grad:
+                    continue
+                if name.startswith("audio_encoder") or name.startswith("speech_encoder"):
+                    encoder_params.append(param)
+                else:
+                    other_params.append(param)
+
+            param_groups = [
+                {"params": other_params, "lr": base_lr},
+                {"params": encoder_params, "lr": encoder_lr},
+            ]
+
+            optimizer_cls, optimizer_kwargs = Trainer.get_optimizer_cls_and_kwargs(self.args, self.model)
+            # Remove 'lr' from kwargs so our per-group LRs take effect
+            optimizer_kwargs.pop("lr", None)
+            self.optimizer = optimizer_cls(param_groups, **optimizer_kwargs)
+
+            # Print a summary so it's easy to verify LRs at startup
+            print(f"[SALMONNTrainer] Optimizer param groups:")
+            print(f"  group[0] (other params):   {len(other_params):5d} tensors, lr={base_lr:.3e}")
+            print(f"  group[1] (encoder params): {len(encoder_params):5d} tensors, lr={encoder_lr:.3e}")
+            return self.optimizer
+
+    trainer = SALMONNTrainer(
         model=model,
         args=training_args,
         train_dataset=dataset,
         tokenizer=tokenizer, # modified
-        data_collator=collator
+        data_collator=collator,
+        # callbacks=[lr_callback],
     )
+    # lr_callback.set_trainer(trainer)
 
     # Check if resuming from checkpoint
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
