@@ -22,10 +22,43 @@ class SALMONN_Dataset(Dataset):
             self.max_frames = 30 * 16000
         else:
             self.max_frames = 120 * 16000
-        self.audio_chunk = 30 * 16000
+        audio_chunk = getattr(args, "audio_chunk", 60)
+        self.audio_chunk = audio_chunk * 16000 # TODO: make this optional
         self.split_audio = args.split_audio
 
         self.data = json.load(open(args.data_path, "r"))["data"]
+
+        max_dur = getattr(args, "max_audio_duration", -1)
+        if max_dur > 0:
+            def _total_hours(entries):
+                total_s = sum(
+                    d
+                    for e in entries
+                    for d in e.get("durations", [])
+                    if d >= 0
+                )
+                return total_s / 3600
+
+            before_count = len(self.data)
+            before_hours = _total_hours(self.data)
+            self.data = [
+                e for e in self.data
+                if all(d < max_dur for d in e.get("durations", []) if d >= 0)
+            ]
+            after_count = len(self.data)
+            after_hours = _total_hours(self.data)
+            removed = before_count - after_count
+            print(
+                f"[Dataset] max_audio_duration={max_dur}s — "
+                f"removed {removed:,} / {before_count:,} entries "
+                f"({removed / before_count * 100:.1f}%)\n"
+                f"  Total duration: {before_hours:.2f}h → {after_hours:.2f}h "
+                f"(removed {before_hours - after_hours:.2f}h)",
+                flush=True,
+            )
+        else:
+            print(f"[Dataset] max_audio_duration disabled — keeping all {len(self.data):,} entries.", flush=True)
+
         self.encoder_type = encoder_type
         self.llm_type = llm_type
         if encoder_type == "zipformer2":
@@ -70,10 +103,11 @@ class SALMONN_Dataset(Dataset):
             if fs != 16000:
                 audio = torchaudio.functional.resample(audio, fs, 16000)
                 fs = 16000
-            audio = audio[:, :self.max_frames]
+            if audio.shape[1] > self.max_frames:
+                audio = audio[:, :self.max_frames]
             assert fs == 16000
             if self.encoder_type == "zipformer2":
-                if self.split_audio:
+                if self.split_audio and audio.shape[-1] > self.audio_chunk:
                     if audio.size(0) > 1:
                         audio = audio.mean(dim=0, keepdim=True)
                     pad_len = (-audio.shape[-1]) % self.audio_chunk
@@ -149,7 +183,7 @@ class SALMONN_Dataset(Dataset):
         chats = sample["messages"]
         text = self.tokenizer.apply_chat_template(chats,tokenize=False)
         if self.llm_type == "Qwen":
-            if self.split_audio:
+            if self.split_audio and len(audio_nums) > 0:
                 for audio_num in audio_nums:
                     text = text.replace("<audio>","<|vision_start|>"*audio_num+"<|vision_end|>",1)
                 model_inputs = self.tokenizer(text, return_tensors="pt")
