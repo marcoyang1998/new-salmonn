@@ -1,16 +1,26 @@
-from transformers import PreTrainedModel, AutoModelForCausalLM, StoppingCriteriaList, StoppingCriteria, AutoFeatureExtractor
-from peft import LoraConfig, TaskType, get_peft_model
-import torch 
-from torch import nn
-import torch.nn.functional as F
-from torch.nn.utils import rnn
-from typing import List, Optional, Tuple, Union
-from transformers.modeling_outputs import CausalLMOutputWithPast
+from typing import Tuple, Union
+
+import contextlib
 import os
 import sys
 
+import torch
+import torch.nn.functional as F
+from peft import LoraConfig, TaskType, get_peft_model
+from torch import nn
+from torch.nn.utils import rnn
+from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers import PreTrainedModel, AutoModelForCausalLM, StoppingCriteriaList, StoppingCriteria, AutoFeatureExtractor
+
 def is_peft_model(model):
     return getattr(model, "peft_config", None) is not None
+
+
+def lens_to_mask(lens: torch.Tensor):
+    max_lens = lens.max()
+    mask = torch.arange(max_lens, device=lens.device).unsqueeze(0) < lens.unsqueeze(1)
+    return mask
+
 
 class StoppingCriteriaSub(StoppingCriteria):
 
@@ -29,7 +39,7 @@ class StoppingCriteriaSub(StoppingCriteria):
 
         unfinished_idxs = ~self.stopped
         check_sample = input_ids[unfinished_idxs]
-        
+
         for stop in self.stops:
             n = len(stop)
             if sample_len < n:
@@ -38,7 +48,7 @@ class StoppingCriteriaSub(StoppingCriteria):
             self.stopped[unfinished_idxs] |= match
 
         return False
-    
+
 class SALMONN(PreTrainedModel):
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
@@ -70,19 +80,19 @@ class SALMONN(PreTrainedModel):
         else:
             self.base_llm = AutoModelForCausalLM.from_config(config)
 
-        
+
         if model_args.lora:
             for name, param in self.base_llm.named_parameters():
                 param.requires_grad = False
             peft_config = LoraConfig(
                 task_type=TaskType.CAUSAL_LM,
-                inference_mode=False,    
+                inference_mode=False,
                 r=model_args.lora_rank,   # 64                          
                 lora_alpha=model_args.lora_alpha,  # 64 
                 lora_dropout=model_args.lora_dropout
             )
             self.base_llm = get_peft_model(self.base_llm, peft_config)
-        
+
         self.weighted_sum_encoder = getattr(model_args, "weighted_sum_encoder", False)
         self.concat_encoder_features = getattr(model_args, "concat_encoder_features", False)
         if self.encoder_type == "dasheng_wavlm":
@@ -112,7 +122,7 @@ class SALMONN(PreTrainedModel):
             num_encoder_layers = sum(self.audio_encoder.encoder.num_encoder_layers)
             if self.weighted_sum_encoder:
                 assert not self.concat_encoder_features, "Cannot use weighted sum when using concat encoder features"
-                zero_init = torch.cat([torch.ones(num_encoder_layers)/num_encoder_layers])
+                zero_init = torch.cat([torch.ones(num_encoder_layers) / num_encoder_layers])
                 self.audio_encoder_layer_weights = torch.nn.Parameter(zero_init, requires_grad=True)
             if self.concat_encoder_features:
                 assert not self.weighted_sum_encoder, "Cannot concat encoder features when using weighted sum"
@@ -153,17 +163,17 @@ class SALMONN(PreTrainedModel):
                 nn.ReLU(),
                 nn.Linear(self.connector_hid_size, config.hidden_size)
             )
-    
+
     def _can_record_outputs(self):
         return getattr(self.base_llm, "_can_record_outputs", {})
-    
+
     def get_zipformer_audio_encoder(self, model_version: str = "xlarge"):
         from spear_encoder.model import MultiKDModel
         from spear_encoder.scaling import ScheduledFloat
         from spear_encoder.subsampling import Conv2dSubsampling
         # from spear_encoder.zipformer import Zipformer2
         from spear_encoder.zipformer_layerwise import Zipformer2
-        
+
         def _to_int_tuple(s: str):
             return tuple(map(int, s.split(",")))
 
@@ -179,7 +189,7 @@ class SALMONN(PreTrainedModel):
             num_heads = "8,8,8,8,8,8,8"
         elif model_version == "large":
             model_dim = 1024
-            output_downsampling_factor = 1 
+            output_downsampling_factor = 1
             downsampling_factor = "1,2,4,8,4,2,1"
             num_encoder_layers = "1,2,2,3,1,1,1"
             feedforward_dim = "3072,3072,3072,3072,3072,3072,3072"
@@ -189,7 +199,7 @@ class SALMONN(PreTrainedModel):
             num_heads = "8,8,8,8,8,8,8"
         else:
             raise ValueError("Unsupported model version")
-        
+
         encoder_embed = Conv2dSubsampling(
             in_channels=128,
             out_channels=model_dim,
@@ -223,7 +233,7 @@ class SALMONN(PreTrainedModel):
             num_codebooks=0,
         )
         return audio_encoder
-    
+
     def get_audio_encoder(self, model_args):
         if model_args.encoder_type == "zipformer2":
             audio_encoder = self.get_zipformer_audio_encoder(model_args.zipformer_version)
@@ -235,7 +245,7 @@ class SALMONN(PreTrainedModel):
                 outputdim=None,
                 trust_remote_code=True
             )
-        
+
         elif self.encoder_type == "dasheng_wavlm":
             from transformers import AutoModel
 
@@ -294,7 +304,7 @@ class SALMONN(PreTrainedModel):
                     fbank_feature_len
                 )
                 if self.weighted_sum_encoder:
-                    middle_out = [m.permute(1,0,2) for m in middle_out]
+                    middle_out = [m.permute(1, 0, 2) for m in middle_out]
                     middle_out = torch.stack(middle_out)
                     middle_out = F.layer_norm(middle_out, (middle_out.shape[-1],))
                     norm_weights = F.softmax(self.audio_encoder_layer_weights, dim=-1).view(-1, 1, 1, 1)
@@ -305,7 +315,7 @@ class SALMONN(PreTrainedModel):
                     middle_out = [F.layer_norm(m.permute(1,0,2), (m.shape[-1],)) for m in middle_out]
                     middle_out = torch.cat(middle_out, dim=-1) # (N,T,num_layers * C)
                     audio_embeds = self.concat_proj(middle_out) # (N,T,C)
-                
+
                 audio_embeds = self.ln_audio(audio_embeds)
             elif self.encoder_type == "dasheng":
                 audio_embeds = self.audio_encoder(fbank_feature.transpose(1, 2)).hidden_states
@@ -358,7 +368,7 @@ class SALMONN(PreTrainedModel):
                         fbank_feature,
                         feature_lens=raw_wavs.sum(-1)
                     )
-                audio_embeds = rnn.pad_sequence(torch.split(audio_outputs.last_hidden_state, audio_output_lengths.tolist(), dim=0),batch_first=True)            
+                audio_embeds = rnn.pad_sequence(torch.split(audio_outputs.last_hidden_state, audio_output_lengths.tolist(), dim=0),batch_first=True)
                 audio_embeds = self.ln_audio(audio_embeds)
             elif self.encoder_type == "mimo":
                 audio_embeds, _, encoder_output_length, _ = self.audio_encoder.encode(fbank_feature, fbank_feature_len, use_quantizer=False)
@@ -381,7 +391,7 @@ class SALMONN(PreTrainedModel):
                 )
                 audio_embeds = torch.cat((audio_embeds, pad_embeds), dim=1)
                 bsz, seqlen, ndim = audio_embeds.size()
-            
+
             audio_embeds = audio_embeds.view(bsz, seqlen // self.connector_seg_size, ndim * self.connector_seg_size)
             audio_embeds = self.connector(audio_embeds)
 
@@ -401,7 +411,7 @@ class SALMONN(PreTrainedModel):
                 return audio_embeds, torch.ceil(encoder_output_length/self.connector_seg_size).to(torch.int64)
             elif self.encoder_type == "audio_flamingo":
                 return audio_embeds, torch.ceil(fbank_feature_len/(4*self.connector_seg_size)).to(torch.int64)
-    
+
     def _get_feat_extract_output_lengths(self, input_lengths):
         input_lengths_leave = input_lengths % 100
         feat_lengths = (input_lengths_leave - 1) // 2 + 1
@@ -409,72 +419,90 @@ class SALMONN(PreTrainedModel):
         return output_lengths
 
     def prepare_inputs_labels_for_speech(self, input_ids, attention_mask, labels, fbank_feature, fbank_feature_len, raw_wavs):
+
         if self.llm_type == "Qwen":
             bos_id = 151652
             padding_id = 151643
+            vision_pad_id = 151654
         elif self.llm_type == "Llama":
             bos_id = 128002
             padding_id = 128004
         audio_embeds, audio_embeds_lens = self.encode_audio(fbank_feature, fbank_feature_len, raw_wavs)
-        _, seqlen, dim = audio_embeds.size()
-        bsz = input_ids.shape[0]
-        input_embeds_list = []
-        attention_mask_list = []
-        audio_num = 0
-        if labels is not None:
-            labels_list = []
-            for i in range(bsz):
-                if is_peft_model(self.base_llm):
-                    current_input_embeds = self.base_llm.model.model.embed_tokens(input_ids[i].to(torch.int64))
-                else:
-                    current_input_embeds = self.base_llm.model.embed_tokens(input_ids[i].to(torch.int64))
-                current_labels = labels[i]
-                # find where currect_input_ids == bos_id, return all the index
-                bos_idx = (input_ids[i] == bos_id).nonzero(as_tuple=True)[0]
-                for idx in bos_idx:
-                    audio_len = min(audio_embeds_lens[audio_num], seqlen)
-                    current_input_embeds = torch.cat((current_input_embeds[:idx+1],audio_embeds[audio_num,:audio_len,:],current_input_embeds[idx+1:]),dim=0)
-                    current_labels = torch.cat((current_labels[:idx+1], torch.full((audio_len,), fill_value=-100, dtype=torch.long).to(current_labels.device),current_labels[idx+1:]),dim=0)
-                    audio_num += 1
-                    bos_idx += audio_len
-                current_attention_mask = torch.ones((len(current_input_embeds),), dtype=torch.long).to(current_labels.device)
-                input_embeds_list.append(current_input_embeds)
-                attention_mask_list.append(current_attention_mask)
-                labels_list.append(current_labels)
-            input_embeds = rnn.pad_sequence(input_embeds_list, batch_first=True)
-            attention_mask = rnn.pad_sequence(attention_mask_list, batch_first=True, padding_value=0)
-            labels = rnn.pad_sequence(labels_list, batch_first=True, padding_value=-100)
-            return input_embeds, attention_mask, labels
+ 
+        audio_embeds_mask = lens_to_mask(audio_embeds_lens)
+        packed_audio_embeds = audio_embeds[audio_embeds_mask]
+        audio_placeholder_mask = input_ids == vision_pad_id
+
+        if is_peft_model(self.base_llm):
+            embed_module = self.base_llm.model.model.embed_tokens
         else:
-            for i in range(bsz):
-                if is_peft_model(self.base_llm):
-                    current_input_embeds = self.base_llm.model.model.embed_tokens(input_ids[i].to(torch.int64))
-                else:
-                    current_input_embeds = self.base_llm.model.embed_tokens(input_ids[i].to(torch.int64))
-                # find where currect_input_ids == bos_id, return all the index
-                bos_idx = (input_ids[i] == bos_id).nonzero(as_tuple=True)[0]
-                padding_idx = (input_ids[i] == padding_id).nonzero(as_tuple=True)[0]
-                for idx in bos_idx:
-                    audio_len = min(audio_embeds_lens[audio_num], seqlen)
-                    current_input_embeds = torch.cat((current_input_embeds[:idx+1],audio_embeds[audio_num,:audio_len,:],current_input_embeds[idx+1:]),dim=0)
-                    audio_num += 1
-                    bos_idx += audio_len
-                    padding_idx += audio_len
-                current_attention_mask = torch.ones((len(current_input_embeds),), dtype=torch.long).to(current_input_embeds.device)
-                current_attention_mask[padding_idx] = 0
-                input_embeds_list.append(current_input_embeds)
-                attention_mask_list.append(current_attention_mask)
-            input_embeds = rnn.pad_sequence(input_embeds_list, batch_first=True, padding_side="left")
-            attention_mask = rnn.pad_sequence(attention_mask_list, batch_first=True, padding_value=0, padding_side="left")
-            return input_embeds, attention_mask, None
+            embed_module = self.base_llm.model.embed_tokens
+        
+        input_embeds = embed_module(input_ids)
+        input_embeds = input_embeds.masked_scatter(audio_placeholder_mask.unsqueeze(-1), packed_audio_embeds)
+
+        return input_embeds, attention_mask, labels
     
+
+        # _, seqlen, dim = audio_embeds.size()
+        # bsz = input_ids.shape[0]
+        # input_embeds_list = []
+        # attention_mask_list = []
+        # audio_num = 0
+        # if labels is not None:
+        #     labels_list = []
+        #     for i in range(bsz):
+        #         if is_peft_model(self.base_llm):
+        #             current_input_embeds = self.base_llm.model.model.embed_tokens(input_ids[i].to(torch.int64))
+        #         else:
+        #             current_input_embeds = self.base_llm.model.embed_tokens(input_ids[i].to(torch.int64))
+        #         current_labels = labels[i]
+        #         # find where currect_input_ids == bos_id, return all the index
+        #         bos_idx = (input_ids[i] == bos_id).nonzero(as_tuple=True)[0]
+        #         for idx in bos_idx:
+        #             audio_len = min(audio_embeds_lens[audio_num], seqlen)
+        #             current_input_embeds = torch.cat((current_input_embeds[:idx+1], audio_embeds[audio_num, :audio_len, :], current_input_embeds[idx+1:]), dim=0)
+        #             current_labels = torch.cat((current_labels[:idx+1], torch.full((audio_len,), fill_value=-100, dtype=torch.long).to(current_labels.device), current_labels[idx+1:]), dim=0)
+        #             audio_num += 1
+        #             bos_idx += audio_len
+        #         current_attention_mask = torch.ones((len(current_input_embeds),), dtype=torch.long).to(current_labels.device)
+        #         input_embeds_list.append(current_input_embeds)
+        #         attention_mask_list.append(current_attention_mask)
+        #         labels_list.append(current_labels)
+        #     input_embeds = rnn.pad_sequence(input_embeds_list, batch_first=True)
+        #     attention_mask = rnn.pad_sequence(attention_mask_list, batch_first=True, padding_value=0)
+        #     labels = rnn.pad_sequence(labels_list, batch_first=True, padding_value=-100)
+        #     return input_embeds, attention_mask, labels
+        # else:
+        #     for i in range(bsz):
+        #         if is_peft_model(self.base_llm):
+        #             current_input_embeds = self.base_llm.model.model.embed_tokens(input_ids[i].to(torch.int64))
+        #         else:
+        #             current_input_embeds = self.base_llm.model.embed_tokens(input_ids[i].to(torch.int64))
+        #         # find where currect_input_ids == bos_id, return all the index
+        #         bos_idx = (input_ids[i] == bos_id).nonzero(as_tuple=True)[0]
+        #         padding_idx = (input_ids[i] == padding_id).nonzero(as_tuple=True)[0]
+        #         for idx in bos_idx:
+        #             audio_len = min(audio_embeds_lens[audio_num], seqlen)
+        #             current_input_embeds = torch.cat((current_input_embeds[:idx+1],audio_embeds[audio_num,:audio_len,:],current_input_embeds[idx+1:]),dim=0)
+        #             audio_num += 1
+        #             bos_idx += audio_len
+        #             padding_idx += audio_len
+        #         current_attention_mask = torch.ones((len(current_input_embeds),), dtype=torch.long).to(current_input_embeds.device)
+        #         current_attention_mask[padding_idx] = 0
+        #         input_embeds_list.append(current_input_embeds)
+        #         attention_mask_list.append(current_attention_mask)
+        #     input_embeds = rnn.pad_sequence(input_embeds_list, batch_first=True, padding_side="left")
+        #     attention_mask = rnn.pad_sequence(attention_mask_list, batch_first=True, padding_value=0, padding_side="left")
+        #     return input_embeds, attention_mask, None
+
     def maybe_autocast(self, dtype=torch.bfloat16):
         # if on cpu, don't use autocast
         # if on gpu, use autocast with dtype if provided, otherwise use torch.float16
         enable_autocast = self.device != torch.device("cpu")
 
         if enable_autocast:
-            return torch.amp.autocast(device_type="cuda",dtype=dtype)
+            return torch.amp.autocast(device_type="cuda", dtype=dtype)
         else:
             return contextlib.nullcontext()
 
@@ -488,9 +516,9 @@ class SALMONN(PreTrainedModel):
             "texts": texts,
         }
         torch.save(payload, dump_path)
-    
+
     def forward(
-        self, 
+        self,
         input_ids = None,
         attention_mask = None,
         position_ids = None,
@@ -510,7 +538,7 @@ class SALMONN(PreTrainedModel):
         # import torch.distributed as dist
         # rank = dist.get_rank()
         # print(f"Current rank: {rank}, audio paths: {sorted(audio_paths)}")
-        
+
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
@@ -529,6 +557,7 @@ class SALMONN(PreTrainedModel):
         #         pass
         #     assert False, "Input sequence length is too long, may cause OOM. The last batch has been saved for debugging."
 
+        # with self.maybe_autocast():
         input_embeds, attention_mask, labels = self.prepare_inputs_labels_for_speech(
             input_ids, attention_mask, labels, fbank_feature, fbank_feature_len, raw_wavs
         )
@@ -548,7 +577,7 @@ class SALMONN(PreTrainedModel):
             )
 
         return outputs
-        
+
     def generate(
         self,
         input_ids,
@@ -596,5 +625,5 @@ class SALMONN(PreTrainedModel):
                 attention_mask=attention_mask,
                 pad_token_id=self.base_llm.config.eos_token_id
             )
-        
+
         return outputs
