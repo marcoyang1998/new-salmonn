@@ -18,7 +18,9 @@ override_keys = [
     "zipformer_version",
     "connector_hid_size",
     "connector_seg_size",
-    "connector_type"
+    "connector_type",
+    "expand_vocab",
+    "inject_temporal_embedding",
 ]
 
 def override_args(checkpoint_path: str, default_model_args):
@@ -47,7 +49,15 @@ class InferenceManager:
         task_filter=None,
         split_audio: bool = False,
         disable_thinking: bool=True,
-        tokenizer_path: str = TOKENIZER_PATH
+        tokenizer_path: str = TOKENIZER_PATH,
+        use_beam_search: bool = False,
+        beam_size: int = 4,
+        use_nucleus_sampling: bool = False,
+        temperature: float = 0.7,
+        top_p: float = 0.8,
+        top_k: int = 20,
+        min_p: float = 0.0,
+        seed: int = 42,
     ):
         self.model_args = get_model_args(checkpoint_path)
         self.model_args = override_args(checkpoint_path, self.model_args)
@@ -55,7 +65,16 @@ class InferenceManager:
         self.device = device
         self.task_filter = task_filter
         self.split_audio = split_audio
-        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+        self.use_beam_search = use_beam_search
+        self.beam_size = beam_size
+        self.use_nucleus_sampling = use_nucleus_sampling
+        self.temperature = temperature
+        self.top_p = top_p
+        self.top_k = top_k
+        self.min_p = min_p
+        self.seed = seed
+        # TODO: check if using checkpoint_path is safe
+        self.tokenizer = AutoTokenizer.from_pretrained(checkpoint_path)
         self.fbank = get_fbank(self.model_args)
         self.model = self._load_model()
         self.disable_thinking = disable_thinking
@@ -68,6 +87,8 @@ class InferenceManager:
             torch_dtype="auto",
             device_map=self.device
         )
+        if self.model_args.inject_temporal_embedding:
+            model.register_temporal_tokens(self.tokenizer)
         model.eval()
         return model
 
@@ -94,13 +115,32 @@ class InferenceManager:
 
         model_inputs = prepare_model_inputs(texts, audio_nums, self.tokenizer, self.model)
 
+        if self.use_beam_search:
+            generation_config = {
+                "num_beams": self.beam_size,
+                "early_stopping": True,
+                "do_sample": False,
+            }
+        elif self.use_nucleus_sampling:
+            generation_config = {
+                "do_sample": True,
+                "temperature": self.temperature,
+                "top_p": self.top_p,
+                "top_k": self.top_k,
+                "min_p": self.min_p,
+            }
+        else:
+            generation_config = {}
         with torch.no_grad():
+            # Fix the seed right before generation for deterministic nucleus sampling.
+            torch.manual_seed(self.seed)
             generated_ids = self.model.generate(
                 **model_inputs,
                 fbank_feature=features,
                 fbank_feature_len=feature_lens,
                 raw_wavs=raw_wavs,
                 max_new_tokens=self.max_new_tokens,
+                **generation_config,
             )
 
         for i, generated_id in enumerate(generated_ids):

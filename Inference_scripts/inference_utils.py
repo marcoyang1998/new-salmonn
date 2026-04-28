@@ -357,5 +357,7 @@ def get_model_args(checkpoint_path: str):
             connector_hid_size: int = 4096
             concat_encoder_features: bool = False
             zipformer_version: str = "xlarge"
+            expand_vocab: bool = False
+            inject_temporal_embedding: bool = False
 
     return ModelArguments()
