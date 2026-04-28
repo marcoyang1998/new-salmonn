@@ -1,4 +1,5 @@
 import sys
+import io
 import json
 import math
 import random
@@ -11,6 +12,14 @@ from lhotse import Fbank, FbankConfig
 from torchaudio.transforms import MelSpectrogram
 from transformers import AutoFeatureExtractor, WhisperFeatureExtractor, AutoProcessor
 import soundfile as sf
+from petrel_client.client import Client
+
+PETRELOSS_CONFIG = "/mnt/shared-storage-user/housiyuan/xiaoyu/petreloss.conf"
+
+def load_audio_from_petrel_oss(audio_path: str, client: Client):
+    bytes_data = client.get(audio_path)
+    waveform, orig_sr = torchaudio.load(io.BytesIO(bytes_data))
+    return waveform, orig_sr
 
 class SALMONN_Dataset(Dataset):
     def __init__(self, args, tokenizer, encoder_type, llm_type):
@@ -59,9 +68,17 @@ class SALMONN_Dataset(Dataset):
         else:
             print(f"[Dataset] max_audio_duration disabled — keeping all {len(self.data):,} entries.", flush=True)
 
+        # lengths[i] = max audio duration (seconds) across all audios in sample i.
+        # Used by AudioLengthGroupedSampler when group_by_audio_length=True.
+        # Falls back to 0.0 for entries without a "durations" field.
+        self.lengths = [
+            max((d for d in e.get("durations", []) if d >= 0), default=0.0)
+            for e in self.data
+        ]
+
         self.encoder_type = encoder_type
         self.llm_type = llm_type
-        if encoder_type == "zipformer2":
+        if encoder_type == "zipformer2" or encoder_type == "spear_transformer":
             self.fbank = Fbank(FbankConfig(num_mel_bins=128))
         elif encoder_type == "dasheng":
             self.fbank = AutoFeatureExtractor.from_pretrained("/mnt/bn/audio-visual-llm-data6/wangsiyin/SALMONN/dasheng", trust_remote_code=True)
@@ -86,7 +103,14 @@ class SALMONN_Dataset(Dataset):
         elif encoder_type == "audio_flamingo":
             self.fbank = WhisperFeatureExtractor.from_pretrained("/mnt/bn/audio-visual-llm-data6/ckpts/audio-flamingo-3-hf")
 
+        self.client = Client(PETRELOSS_CONFIG)
 
+    def _load_audio(self, audio: str):
+        if audio.startswith("s3://"):
+            return load_audio_from_petrel_oss(audio, self.client)
+        else:
+            return torchaudio.load(audio)
+    
     def __len__(self):
         return len(self.data)
 
@@ -98,7 +122,7 @@ class SALMONN_Dataset(Dataset):
         raw_wavs = []
         audio_nums = []
         for audio_path in sample["audios"]:
-            audio, fs = torchaudio.load(audio_path)
+            audio, fs = self._load_audio(audio_path)
             # some of our audio is not 16k hz, so we first resample them and then truncate it
             if fs != 16000:
                 audio = torchaudio.functional.resample(audio, fs, 16000)
@@ -106,7 +130,7 @@ class SALMONN_Dataset(Dataset):
             if audio.shape[1] > self.max_frames:
                 audio = audio[:, :self.max_frames]
             assert fs == 16000
-            if self.encoder_type == "zipformer2":
+            if self.encoder_type == "zipformer2" or self.encoder_type == "spear_transformer":
                 if self.split_audio and audio.shape[-1] > self.audio_chunk:
                     if audio.size(0) > 1:
                         audio = audio.mean(dim=0, keepdim=True)
@@ -188,7 +212,9 @@ class SALMONN_Dataset(Dataset):
                     text = text.replace("<audio>","<|vision_start|>"*audio_num+"<|vision_end|>",1)
                 model_inputs = self.tokenizer(text, return_tensors="pt")
             else:
-                model_inputs = self.tokenizer(text.replace("<audio>","<|vision_start|><|vision_end|>"), return_tensors="pt")
+                model_inputs = self.tokenizer(
+                    text.replace("<audio>","<|vision_start|><|vision_end|>"), return_tensors="pt"
+                )
         elif self.llm_type == "Llama":
             model_inputs = self.tokenizer(text.replace("<audio>","<|reserved_special_token_0|><|reserved_special_token_1|>"), return_tensors="pt", add_special_tokens=False)
         input_ids = model_inputs["input_ids"][0]
