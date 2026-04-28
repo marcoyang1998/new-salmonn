@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import math
 import pathlib
 from dataclasses import dataclass, field, asdict
 from typing import Optional, List, Union
@@ -11,6 +12,7 @@ import torch
 from torch.nn.utils.rnn import pad_sequence
 import transformers
 from transformers import AutoConfig, AutoTokenizer, Trainer, TrainerCallback
+from torch.utils.data import Sampler
 
 from modeling_salmonn import SALMONN
 from datasets import SALMONN_Dataset
@@ -35,6 +37,10 @@ class ModelArguments:
     concat_encoder_features: bool = field(default=False)
     encoder_lora: bool = field(default=False)
     encoder_lora_rank: int = field(default=16)
+    expand_vocab: bool = field(default=False)
+    inject_temporal_embedding: bool = field(default=False)
+    temporal_granularity: float = field(default=0.5, metadata={"help": "Timestamp injection granularity in seconds (e.g. 0.5 → <|0.50|> every 0.5 s)."})
+    encoder_frame_rate: int = field(default=50, metadata={"help": "Audio encoder output frame rate in Hz before the connector (e.g. 50 for SpEAR/zipformer2)."})
 
 @dataclass
 class DataArguments:
@@ -51,13 +57,36 @@ class DataArguments:
 class TrainingArguments(transformers.TrainingArguments):
     report_to: Optional[str] = field(default="wandb")
     run_name: Optional[str] = field(default="debug")
+    group_by_audio_length: bool = field(
+        default=False,
+        metadata={"help": "Group training batches by audio duration to minimise intra-batch padding waste. "
+                          "Requires the dataset JSON to have a 'durations' field (add via compute_audio_durations.py). "
+                          "Batches are length-sorted then shuffled at the batch level each epoch."},
+    )
+    audio_length_bucket_boundaries: Optional[List[float]] = field(
+        default=None,
+        metadata={"help": "Bucket boundary breakpoints in seconds for group_by_audio_length. "
+                          "Samples are assigned to the bucket [boundaries[i], boundaries[i+1]). "
+                          "Defaults to [0, 10, 20, 30, 40, 120] when not set."},
+    )
 
     min_learning_rate: Optional[float] = field(default=None)
     from_scratch: bool = field(default=False)
     encoder_lr_ratio: Optional[float] = field(
         default=None,
         metadata={"help": "LR multiplier for the audio encoder parameters (e.g. 0.1 = 1/10 of base LR). "
-                          "Only effective when freeze_encoder=False."},
+                          "Used when freeze_encoder=False, or after the encoder is unfrozen via encoder_unfreeze_step."},
+    )
+    encoder_unfreeze_step: int = field(
+        default=0,
+        metadata={"help": """
+Controls encoder freezing behaviour (together with freeze_encoder):
+  freeze_encoder=True,  encoder_unfreeze_step=0  -> encoder is always frozen.
+  freeze_encoder=True,  encoder_unfreeze_step=N  -> encoder is frozen for the first N steps,
+                                                    then unfrozen with lr = learning_rate * encoder_lr_ratio.
+  freeze_encoder=False                           -> encoder is never frozen
+                                                    (encoder_lr_ratio applies from step 0).
+"""},
     )
 
 def load_model_and_dataset(model_args, data_args, training_args):
@@ -67,6 +96,8 @@ def load_model_and_dataset(model_args, data_args, training_args):
         model_config.torch_dtype = torch.bfloat16 if training_args.bf16 else None
         model_config.attn_implementation = model_args.attn_implementation
         model = SALMONN(model_config, model_args)
+        if model_args.expand_vocab:
+            model.expand_llm_vocab(tokenizer)
     else:
         tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path)
         model_config = AutoConfig.from_pretrained(os.path.join(model_args.model_name_or_path,"config.json"))
@@ -78,6 +109,8 @@ def load_model_and_dataset(model_args, data_args, training_args):
             torch_dtype="auto"
         )
     dataset = SALMONN_Dataset(data_args, tokenizer, model_args.encoder_type, model_args.llm_type)
+    if model_args.inject_temporal_embedding:
+        model.register_temporal_tokens(tokenizer)
     return tokenizer, model, dataset
 
 def main():
@@ -100,6 +133,39 @@ def main():
         training_args.lr_scheduler_kwargs["min_lr"] = training_args.min_learning_rate
 
     tokenizer, model, dataset = load_model_and_dataset(model_args, data_args, training_args)
+
+    # lora_A / lora_B are not in the original SpEAR checkpoint and may also not
+    # be in older SALMONN checkpoints (or may have been saved with garbage values
+    # from a previous buggy run).  Re-initialise them here, AFTER from_pretrained
+    # has fully loaded all checkpoint weights, so this always wins.
+    if model_args.encoder_lora and model_args.encoder_type == "zipformer2":
+        from spear_encoder.scaling import ScaledLinear_lora
+        n_reinit = 0
+        for module in model.audio_encoder.modules():
+            if isinstance(module, ScaledLinear_lora) and module.r > 0:
+                with torch.no_grad():
+                    torch.nn.init.kaiming_uniform_(module.lora_A, a=math.sqrt(5))
+                    torch.nn.init.zeros_(module.lora_B)
+                module.merged = False
+                n_reinit += 1
+        print(f"[train] Re-initialised lora_A/lora_B for {n_reinit} ScaledLinear_lora modules.")
+
+    # When doing delayed encoder unfreezing, encoder params must have requires_grad=True
+    # from the very start so DeepSpeed ZeRO includes them in its partitioning.
+    # Gradient flow is then controlled inside encode_audio via torch.set_grad_enabled,
+    # toggled through model._encoder_frozen at the designated step.
+    if training_args.encoder_unfreeze_step > 0:
+        n = 0
+        for name, param in model.named_parameters():
+            if name.startswith("audio_encoder") or name.startswith("speech_encoder"):
+                param.requires_grad_(True)
+                n += 1
+        # _encoder_frozen starts True; the callback flips it to False at unfreeze_step
+        model._encoder_frozen = True
+        print(
+            f"[train] Enabled requires_grad on {n} encoder params for DeepSpeed ZeRO; "
+            f"gradients suppressed via set_grad_enabled until step {training_args.encoder_unfreeze_step}."
+        )
 
     class Collator:
         def __call__(self, samples):
@@ -139,12 +205,126 @@ def main():
 
     lr_callback = LRLoggingCallback()
 
+    class EncoderUnfreezeCallback(TrainerCallback):
+        """Unfreezes the audio encoder at a given global step by setting
+        model._encoder_frozen = False, which causes encode_audio to switch
+        from torch.set_grad_enabled(False) to True for encoder calls.
+        Encoder params are already in the optimizer from step 0 for DeepSpeed ZeRO."""
+
+        def __init__(self, unfreeze_step: int, encoder_lr_ratio: Optional[float]):
+            self.unfreeze_step = unfreeze_step
+            self.encoder_lr_ratio = encoder_lr_ratio if encoder_lr_ratio is not None else 1.0
+            self._unfrozen = False
+
+        def on_step_end(self, args, state, control, model=None, **kwargs):
+            if self._unfrozen or state.global_step < self.unfreeze_step:
+                return
+
+            model._encoder_frozen = False
+
+            encoder_lr = args.learning_rate * self.encoder_lr_ratio
+            print(
+                f"[EncoderUnfreezeCallback] Step {state.global_step}: "
+                f"model._encoder_frozen set to False — encoder now updating, "
+                f"lr={encoder_lr:.3e} (ratio={self.encoder_lr_ratio})"
+            )
+            self._unfrozen = True
+
+    class AudioLengthGroupedSampler(Sampler):
+        """Assigns samples to predefined duration buckets, shuffles within each
+        bucket, then concatenates and returns ALL indices.  The HF Trainer /
+        accelerate automatically stripes indices across ranks
+        ([rank, rank+world_size, ...]), so every rank ends up with samples
+        from the same bucket at each global step — no manual rank handling
+        needed (and no risk of double-sharding from accelerate wrapping).
+
+        Args:
+            lengths:            per-sample max-audio-duration (seconds).
+            batch_size:         per-GPU batch size.
+            world_size:         total number of data-parallel ranks (used only
+                                for padding so total is evenly divisible).
+            seed:               base RNG seed (epoch is added on top).
+            bucket_boundaries:  ascending list of duration breakpoints (secs).
+                                Samples are assigned to bucket [b[i], b[i+1]).
+                                Samples beyond the last boundary go into the
+                                last bucket.
+                                Default: [0, 10, 20, 30, 40, 120].
+        """
+
+        DEFAULT_BOUNDARIES = [0, 10, 20, 30, 40, 120]
+
+        def __init__(self, lengths, batch_size, world_size=1, seed=0,
+                     bucket_boundaries=None):
+            self.lengths = lengths
+            self.batch_size = batch_size
+            self.world_size = world_size
+            self.seed = seed
+            self.bucket_boundaries = bucket_boundaries or self.DEFAULT_BOUNDARIES
+            self.epoch = 0
+
+            # Pad so total is divisible by (world_size * batch_size), ensuring
+            # every rank sees exactly the same number of complete batches.
+            n = len(lengths)
+            global_batch = world_size * batch_size
+            self.total_size = math.ceil(n / global_batch) * global_batch
+
+        def set_epoch(self, epoch: int):
+            self.epoch = epoch
+
+        def __len__(self):
+            return self.total_size
+
+        def _get_bucket_id(self, duration: float) -> int:
+            for i in range(len(self.bucket_boundaries) - 1):
+                if duration < self.bucket_boundaries[i + 1]:
+                    return i
+            return len(self.bucket_boundaries) - 2
+
+        def __iter__(self):
+            g = torch.Generator()
+            g.manual_seed(self.seed + self.epoch)
+
+            n = len(self.lengths)
+            n_buckets = len(self.bucket_boundaries) - 1
+
+            # Assign each sample to a bucket
+            buckets = [[] for _ in range(n_buckets)]
+            for i, dur in enumerate(self.lengths):
+                buckets[self._get_bucket_id(dur)].append(i)
+
+            # Shuffle within each bucket, then concatenate
+            shuffled = []
+            for bucket in buckets:
+                if not bucket:
+                    continue
+                perm = torch.randperm(len(bucket), generator=g).tolist()
+                shuffled.extend(bucket[p] for p in perm)
+
+            # Pad to total_size by repeating from the front
+            shuffled = shuffled + shuffled[: self.total_size - n]
+
+            # Shuffle the order of global batches (world_size * batch_size
+            # consecutive indices) so the bucket ordering across training steps
+            # is randomised, while keeping all ranks in the same bucket per step.
+            global_batch = self.world_size * self.batch_size
+            n_global_batches = self.total_size // global_batch
+            global_batch_order = torch.randperm(n_global_batches, generator=g).tolist()
+
+            indices = []
+            for gb in global_batch_order:
+                indices.extend(shuffled[gb * global_batch: (gb + 1) * global_batch])
+
+            return iter(indices)
+
     class SALMONNTrainer(Trainer):
         """Trainer subclass that supports a separate (lower) LR for the audio encoder."""
 
         def create_optimizer(self):
             encoder_lr_ratio = self.args.encoder_lr_ratio
-            if encoder_lr_ratio is None or encoder_lr_ratio == 1.0 or model_args.freeze_encoder:
+            use_delayed_unfreeze = self.args.encoder_unfreeze_step > 0
+            split_encoder = (not model_args.freeze_encoder) or use_delayed_unfreeze
+
+            if not split_encoder or encoder_lr_ratio is None:
                 return super().create_optimizer()
 
             base_lr = self.args.learning_rate
@@ -153,11 +333,11 @@ def main():
             encoder_params = []
             other_params = []
             for name, param in self.model.named_parameters():
-                if not param.requires_grad:
-                    continue
                 if name.startswith("audio_encoder") or name.startswith("speech_encoder"):
+                    # Include encoder params regardless of requires_grad so DeepSpeed
+                    # sets them up from the start (add_param_group is unsupported in ZeRO).
                     encoder_params.append(param)
-                else:
+                elif param.requires_grad:
                     other_params.append(param)
 
             param_groups = [
@@ -173,8 +353,52 @@ def main():
             # Print a summary so it's easy to verify LRs at startup
             print(f"[SALMONNTrainer] Optimizer param groups:")
             print(f"  group[0] (other params):   {len(other_params):5d} tensors, lr={base_lr:.3e}")
-            print(f"  group[1] (encoder params): {len(encoder_params):5d} tensors, lr={encoder_lr:.3e}")
+            print(f"  group[1] (encoder params): {len(encoder_params):5d} tensors, lr={encoder_lr:.3e} {'(frozen until step ' + str(self.args.encoder_unfreeze_step) + ')' if use_delayed_unfreeze else ''}")
             return self.optimizer
+
+        def _get_train_sampler(self, train_dataset=None):
+            if train_dataset is None:
+                train_dataset = self.train_dataset
+            if not self.args.group_by_audio_length or not hasattr(train_dataset, "lengths"):
+                return super()._get_train_sampler(train_dataset)
+
+            world_size = int(os.environ.get("WORLD_SIZE", 1))
+            sampler = AudioLengthGroupedSampler(
+                lengths=train_dataset.lengths,
+                batch_size=self.args.per_device_train_batch_size,
+                world_size=world_size,
+                seed=self.args.seed,
+                bucket_boundaries=self.args.audio_length_bucket_boundaries,
+            )
+            print(
+                f"[SALMONNTrainer] Using AudioLengthGroupedSampler "
+                f"(world_size={world_size}, "
+                f"batch_size={self.args.per_device_train_batch_size}, "
+                f"n_samples={len(train_dataset)}, "
+                f"boundaries={sampler.bucket_boundaries})"
+            )
+            return sampler
+
+    # callbacks = [GPUStatsCallback()]
+    callbacks = []
+    if training_args.encoder_unfreeze_step > 0:
+        if not model_args.freeze_encoder:
+            raise ValueError(
+                "encoder_unfreeze_step > 0 requires freeze_encoder=True. "
+                "Modes: (freeze_encoder=True, encoder_unfreeze_step=0) = always frozen; "
+                "(freeze_encoder=True, encoder_unfreeze_step=N) = frozen then unfrozen at step N; "
+                "(freeze_encoder=False) = never frozen."
+            )
+        callbacks.append(
+            EncoderUnfreezeCallback(
+                unfreeze_step=training_args.encoder_unfreeze_step,
+                encoder_lr_ratio=training_args.encoder_lr_ratio,
+            )
+        )
+        print(
+            f"[train] Encoder will be unfrozen at step {training_args.encoder_unfreeze_step} "
+            f"with lr_ratio={training_args.encoder_lr_ratio}"
+        )
 
     trainer = SALMONNTrainer(
         model=model,
@@ -182,12 +406,20 @@ def main():
         train_dataset=dataset,
         tokenizer=tokenizer, # modified
         data_collator=collator,
-        # callbacks=[lr_callback],
+        callbacks=callbacks,
     )
     # lr_callback.set_trainer(trainer)
+    # all_trainable = []
+    # for name, param in model.named_parameters():
+    #     if param.requires_grad:
+    #         all_trainable.append(name)
+    # print(f"All trainable parameters: {all_trainable}")
+    total_trainable = sum([p.numel() for p in model.parameters() if p.requires_grad])
+    print(f"Total number of trainable parameters: {total_trainable}")
 
     # Check if resuming from checkpoint
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
+        print("Resuming from existing checkpoint...")
         trainer.train(resume_from_checkpoint=True)
     else:
         trainer.train()
