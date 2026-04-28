@@ -474,6 +474,7 @@ class SALMONN(PreTrainedModel):
         elif model_args.encoder_type == "spear_transformer":
             from spear_transformer_encoder.model import get_spear_transformer_encoder_600M
             audio_encoder = get_spear_transformer_encoder_600M()
+            audio_encoder.to(torch.bfloat16) # SPEAR transformer is trained in bfloat16, we hard set this to prevent error in inference
             
         elif model_args.encoder_type == "dasheng":
             from transformers import AutoModel

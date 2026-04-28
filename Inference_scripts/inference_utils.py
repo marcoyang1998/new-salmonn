@@ -72,7 +72,7 @@ def extract_audio_features(audio_paths: list[str], fbank: Fbank, model, model_ar
             fs = 16000
         audio = audio[:, :max_frames]
 
-        if model_args.encoder_type == "zipformer2":
+        if model_args.encoder_type == "zipformer2" or model_args.encoder_type == "spear_transformer":
             if split_audio:
                 if audio.size(0) > 1:
                     audio = audio.mean(dim=0, keepdim=True)
@@ -175,7 +175,7 @@ def prepare_model_inputs(texts: list[str], audio_nums: list[int], tokenizer: Aut
     ).to(model.device)
 
 def get_fbank(model_args) -> Fbank:
-    if model_args.encoder_type == "zipformer2":
+    if model_args.encoder_type == "zipformer2" or model_args.encoder_type == "spear_transformer":
         return Fbank(FbankConfig(num_mel_bins=128))
     elif model_args.encoder_type == "dasheng":
         return AutoFeatureExtractor.from_pretrained("/mnt/bn/audio-visual-llm-data6/wangsiyin/SALMONN/dasheng", trust_remote_code=True)
@@ -339,7 +339,28 @@ def get_model_args(checkpoint_path: str):
             connector_seg_size: int = 5
             connector_hid_size: int = 4096
 
-    else:        
+    elif "spear_transformer" in checkpoint_path:
+        class ModelArguments:
+            model_name_or_path: str = checkpoint_path
+            base_llm_path: str = ""
+            attn_implementation: str = "flash_attention_2"
+            lora: bool = True
+            lora_rank: int = 64
+            lora_alpha: int = 64
+            lora_dropout: float = 0.05
+            llm_type: str = "Qwen"
+            encoder_type: str = "spear_transformer"
+            audio_encoder_path: str = ""
+            speech_encoder_path: str = ""
+            freeze_encoder: bool = True
+            connector_type: str = "MLP"
+            connector_seg_size: int = 5
+            connector_hid_size: int = 4096
+            concat_encoder_features: bool = True
+            expand_vocab: bool = False
+            inject_temporal_embedding: bool = False
+
+    else:
         class ModelArguments:
             model_name_or_path: str = checkpoint_path
             base_llm_path: str = ""

@@ -84,7 +84,7 @@ class InferenceManager:
             self.model_args.model_name_or_path,
             config=AutoConfig.from_pretrained(os.path.join(self.model_args.model_name_or_path, "config.json")),
             model_args=self.model_args,
-            torch_dtype="auto",
+            torch_dtype=torch.bfloat16,
             device_map=self.device
         )
         if self.model_args.inject_temporal_embedding:
