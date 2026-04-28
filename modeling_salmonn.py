@@ -1,3 +1,6 @@
+import os
+import sys
+
 from transformers import PreTrainedModel, AutoModelForCausalLM, StoppingCriteriaList, StoppingCriteria, AutoFeatureExtractor
 from peft import LoraConfig, TaskType, get_peft_model
 import torch 
@@ -6,7 +9,6 @@ import torch.nn.functional as F
 from torch.nn.utils import rnn
 from typing import List, Optional, Tuple, Union
 from transformers.modeling_outputs import CausalLMOutputWithPast
-import sys
 
 BERT_CKPT="/mnt/shared-storage-gpfs2/brainllm2-share/xiaoyu/models/google-bert--bert-base-uncased"
 
@@ -72,17 +74,41 @@ class SALMONN(PreTrainedModel):
             self.base_llm = AutoModelForCausalLM.from_config(config)
 
         
+        expand_vocab = getattr(model_args, "expand_vocab", False)
+
+        if expand_vocab:
+            # base_llm is always loaded from the original (unexpanded) base LLM checkpoint,
+            # so we can unconditionally resize by the fixed number of new tokens.
+            original_vocab_size = self.base_llm.config.vocab_size
+            target_vocab_size = original_vocab_size + len(self.NEW_SPECIAL_TOKENS)
+            self.base_llm.resize_token_embeddings(target_vocab_size, mean_resizing=False)
+            print(
+                f"[SALMONN.__init__] expand_vocab=True: resized embeddings "
+                f"{original_vocab_size} -> {target_vocab_size}"
+            )
+
         if model_args.lora:
             for name, param in self.base_llm.named_parameters():
                 param.requires_grad = False
-            peft_config = LoraConfig(
+            lora_kwargs = dict(
                 task_type=TaskType.CAUSAL_LM,
-                inference_mode=False,    
-                r=model_args.lora_rank,   # 64                          
-                lora_alpha=model_args.lora_alpha,  # 64 
-                lora_dropout=model_args.lora_dropout
+                inference_mode=False,
+                r=model_args.lora_rank,
+                lora_alpha=model_args.lora_alpha,
+                lora_dropout=model_args.lora_dropout,
             )
-            self.base_llm = get_peft_model(self.base_llm, peft_config)
+            if expand_vocab:
+                lora_kwargs["modules_to_save"] = ["embed_tokens", "lm_head"]
+                self.base_llm.config.tie_word_embeddings = False
+            self.base_llm = get_peft_model(self.base_llm, LoraConfig(**lora_kwargs))
+        elif expand_vocab:
+            # No LoRA: freeze the entire LLM body except embed_tokens and lm_head,
+            # which must be trainable so the new token rows receive gradient updates.
+            for name, param in self.base_llm.named_parameters():
+                if "embed_tokens" in name or "lm_head" in name:
+                    param.requires_grad_(True)
+                else:
+                    param.requires_grad_(False)
         
         self.concat_encoder_features = getattr(model_args, "concat_encoder_features", False)
         
@@ -98,7 +124,30 @@ class SALMONN(PreTrainedModel):
             self.audio_encoder = self.get_audio_encoder(model_args)
         if model_args.audio_encoder_path:
             if self.encoder_type == "zipformer2":
-                info = self.audio_encoder.load_state_dict(torch.load(model_args.audio_encoder_path)["model"], strict=False)
+                import math
+                from spear_encoder.scaling import ScaledLinear_lora
+                info = self.audio_encoder.load_state_dict(
+                    torch.load(model_args.audio_encoder_path, map_location="cpu")["model"],
+                    strict=False,
+                )
+                print(f"Loading info: {info}")
+                # lora_A / lora_B are not in the SpEAR checkpoint.
+                # With HuggingFace low_cpu_mem_usage=True, missing parameters are
+                # materialised as torch.empty (uninitialized / NaN).  Re-initialise
+                # them here so that the subsequent eval() call (which merges lora
+                # into weight) does not corrupt the loaded weights.
+                # Also force merged=False so the merge/unmerge accounting is correct.
+                for module in self.audio_encoder.modules():
+                    if isinstance(module, ScaledLinear_lora) and module.r > 0:
+                        with torch.no_grad():
+                            nn.init.kaiming_uniform_(module.lora_A, a=math.sqrt(5))
+                            nn.init.zeros_(module.lora_B)
+                        module.merged = False
+            elif self.encoder_type == "spear_transformer":
+                info = self.audio_encoder.load_state_dict(
+                    torch.load(model_args.audio_encoder_path, map_location="cpu")["model"],
+                    strict=False,
+                )
                 print(f"Loading info: {info}")
         if model_args.freeze_encoder:
             for name, param in self.audio_encoder.named_parameters():
@@ -108,6 +157,18 @@ class SALMONN(PreTrainedModel):
                 for name, param in self.speech_encoder.named_parameters():
                     param.requires_grad = False
                 self.speech_encoder.eval()
+        encoder_lora = getattr(model_args, "encoder_lora", False)
+        if model_args.encoder_type == "zipformer2" and encoder_lora:
+            for name, param in self.audio_encoder.named_parameters():
+                if "lora_A" in name or "lora_B" in name:
+                    param.requires_grad = True
+                else:
+                    param.requires_grad = False
+            # we decided not to set to eval()
+            # self.audio_encoder.eval()
+        # _encoder_frozen can be toggled at runtime (e.g. by EncoderUnfreezeCallback)
+        # without changing requires_grad, using torch.set_grad_enabled in encode_audio.
+        self._encoder_frozen = model_args.freeze_encoder
         if self.encoder_type == "zipformer2":
             encoder_dim = self.audio_encoder.encoder_dim
             num_encoder_layers = sum(self.audio_encoder.encoder.num_encoder_layers)
@@ -115,6 +176,13 @@ class SALMONN(PreTrainedModel):
                 # assert not self.weighted_sum_encoder, "Cannot concat encoder features when using weighted sum"
                 num_encoder_layers = self.audio_encoder.num_encoder_layers
                 self.concat_proj = nn.Linear(int(num_encoder_layers * encoder_dim), encoder_dim)
+            self.ln_audio = nn.LayerNorm(encoder_dim)
+        elif self.encoder_type == "spear_transformer":
+            encoder_dim = self.audio_encoder.encoder_dim
+            if self.concat_encoder_features:
+                num_encoder_layers = self.audio_encoder.num_encoder_layers + 1
+                self.concat_proj = nn.Linear(int(num_encoder_layers * encoder_dim), encoder_dim)
+            self.ln_audio = nn.LayerNorm(encoder_dim)
             self.ln_audio = nn.LayerNorm(encoder_dim)
         elif self.encoder_type == "dasheng":
             encoder_dim = self.audio_encoder.config.encoder_kwargs["embed_dim"]
@@ -190,7 +258,117 @@ class SALMONN(PreTrainedModel):
                 print("freeze post QFormer proj")
         else:
             raise ValueError(f"Unsupported connector type: {model_args.connector_type}")
-    
+
+        # ---------- temporal embedding injection ----------
+        self.inject_temporal_embedding = getattr(model_args, "inject_temporal_embedding", False)
+        self.temporal_granularity = getattr(model_args, "temporal_granularity", 0.5)
+        if self.inject_temporal_embedding:
+            assert self.connector_type == "MLP", "inject_temporal_embedding is only supported with connector_type=MLP"
+            encoder_frame_rate = getattr(model_args, "encoder_frame_rate", 50)
+            self.output_frame_rate = encoder_frame_rate / self.connector_seg_size  # Hz after MLP connector
+            frames_per_stamp = self.temporal_granularity * self.output_frame_rate
+            assert abs(frames_per_stamp - round(frames_per_stamp)) < 1e-6, (
+                f"temporal_granularity ({self.temporal_granularity}s) must be a multiple of the output frame "
+                f"period (1/{self.output_frame_rate:.4g}s). Got {frames_per_stamp:.6f} frames per stamp, "
+                f"which is not an integer."
+            )
+            # timestamp_token_ids is populated later via register_temporal_tokens(tokenizer)
+            self.timestamp_token_ids = None
+            print(
+                f"[SALMONN] inject_temporal_embedding=True, granularity={self.temporal_granularity}s, "
+                f"output_frame_rate={self.output_frame_rate:.1f}Hz, frames_per_stamp={round(frames_per_stamp)}"
+            )
+
+    # ---------- vocabulary expansion ----------
+
+    # 601 tokens: <|0.00|>, <|0.10|>, ..., <|60.00|>  (0.1 s granularity, 0–60 s)
+    TIMESTAMP_TOKENS = [f"<|{i*0.1:.2f}|>" for i in range(601)]
+    SPEAKER_TOKENS = ["<|speaker1|>", "<|speaker2|>", "<|speaker3|>", "<|speaker4|>", "<|speaker5|>"]
+    NEW_SPECIAL_TOKENS = TIMESTAMP_TOKENS + SPEAKER_TOKENS
+
+    def register_temporal_tokens(self, tokenizer):
+        """Store a map from TIMESTAMP_TOKENS index -> token_id for use in inject_temporal_embeddings.
+
+        Must be called after the tokenizer has been expanded with expand_llm_vocab (or loaded
+        from a checkpoint that already contains the timestamp tokens).
+        """
+        ids = tokenizer.convert_tokens_to_ids(self.TIMESTAMP_TOKENS)
+        self.timestamp_token_ids = ids  # plain list of length 601
+        print(
+            f"[SALMONN] register_temporal_tokens: mapped {len(ids)} timestamp tokens, "
+            f"e.g. <|0.50|> -> {ids[5]}, <|1.00|> -> {ids[10]}"
+        )
+
+    def inject_temporal_embeddings(self, audio_embeds, audio_embeds_lens):
+        """Interleave timestamp token embeddings into audio_embeds at temporal_granularity intervals.
+
+        Every K audio frames one timestamp embedding is appended, giving blocks of (K+1):
+            [a1 … a_K  <|t1|>]  [a_{K+1} … a_{2K}  <|t2|>]  …
+
+        Steps:
+          1. Pad seqlen to a multiple of K.
+          2. Reshape to (bsz, num_blocks, K, dim).
+          3. Build timestamp embeddings (num_blocks, 1, dim) and concatenate → (bsz, num_blocks, K+1, dim).
+          4. Reshape to (bsz, num_blocks*(K+1), dim).
+
+        Args:
+            audio_embeds:      (bsz, seqlen, dim)
+            audio_embeds_lens: (bsz,) valid frame counts (int64)
+
+        Returns:
+            new_audio_embeds:      (bsz, num_blocks*(K+1), dim)
+            new_audio_embeds_lens: (bsz,)
+        """
+        assert self.timestamp_token_ids is not None, (
+            "Call register_temporal_tokens(tokenizer) before using inject_temporal_embedding."
+        )
+        K = max(1, round(self.temporal_granularity * self.output_frame_rate))  # audio frames per stamp
+
+        bsz, seqlen, dim = audio_embeds.shape
+        num_blocks = (seqlen + K - 1) // K  # ceil(seqlen / K)
+
+        # 1. Pad to multiple of K
+        pad_len = num_blocks * K - seqlen
+        if pad_len > 0:
+            audio_embeds = F.pad(audio_embeds, (0, 0, 0, pad_len))  # (bsz, num_blocks*K, dim)
+
+        # 2. Reshape into blocks
+        audio_embeds = audio_embeds.view(bsz, num_blocks, K, dim)  # (bsz, num_blocks, K, dim)
+
+        # 3. Build one timestamp embedding per block: block i gets <|(i+1)*granularity|>
+        embed_tokens = self.base_llm.get_input_embeddings()
+        block_indices = torch.arange(num_blocks, device=audio_embeds.device)
+        ts_times = (block_indices + 1).float() * self.temporal_granularity
+        ts_list_indices = ts_times.div(0.1).round().long().clamp(0, len(self.timestamp_token_ids) - 1)
+        ts_token_ids = torch.tensor(
+            self.timestamp_token_ids, dtype=torch.long, device=audio_embeds.device
+        )[ts_list_indices]                                                    # (num_blocks,)
+        ts_embeds = embed_tokens(ts_token_ids).to(audio_embeds.dtype)        # (num_blocks, dim)
+        ts_embeds = ts_embeds.unsqueeze(0).unsqueeze(2).expand(bsz, -1, 1, -1)  # (bsz, num_blocks, 1, dim)
+
+        # 4. Concatenate and flatten: [a1…aK | ts] per block
+        interleaved = torch.cat([audio_embeds, ts_embeds], dim=2)            # (bsz, num_blocks, K+1, dim)
+        interleaved = interleaved.reshape(bsz, num_blocks * (K + 1), dim)
+
+        new_audio_embeds_lens = audio_embeds_lens + (audio_embeds_lens + K - 1) // K
+        return interleaved, new_audio_embeds_lens
+
+    def expand_llm_vocab(self, tokenizer):
+        """Add timestamp/speaker tokens to *tokenizer*.
+
+        The embedding resize and grad-unfreezing are handled inside __init__,
+        so this only updates the tokenizer. Call this only on the from-scratch
+        path where the tokenizer starts from the unexpanded base LLM tokenizer.
+        """
+        added = tokenizer.add_special_tokens({"additional_special_tokens": self.NEW_SPECIAL_TOKENS})
+        print(
+            f"[SALMONN.expand_llm_vocab] Added {added} new special tokens; "
+            f"LLM vocab size = {self.base_llm.config.vocab_size}."
+        )
+        return added
+
+    # ------------------------------------------
+
     @classmethod
     def init_speech_Qformer(cls, num_query_token, speech_width, num_hidden_layers=2):
         from models.Qformer import BertConfig, BertLMHeadModel
@@ -293,6 +471,10 @@ class SALMONN(PreTrainedModel):
                 encoder_dim=max(_to_int_tuple("1280,1280,1280,1280,1280,1280,1280")),
                 num_codebooks=0,
             )
+        elif model_args.encoder_type == "spear_transformer":
+            from spear_transformer_encoder.model import get_spear_transformer_encoder_600M
+            audio_encoder = get_spear_transformer_encoder_600M()
+            
         elif model_args.encoder_type == "dasheng":
             from transformers import AutoModel
 
@@ -352,13 +534,16 @@ class SALMONN(PreTrainedModel):
 
         return audio_encoder
 
-    def encode_audio(self, fbank_feature, fbank_feature_len, raw_wavs):
+    def encode_audio(self, fbank_feature, fbank_feature_len, raw_wavs, freeze_encoder=None):
+        if freeze_encoder is None:
+            freeze_encoder = self._encoder_frozen
         with self.maybe_autocast(next(self.audio_encoder.parameters()).dtype):
             if self.encoder_type == "zipformer2":
-                audio_embeds, encoder_out_lens, middle_out = self.audio_encoder.forward_encoder(
-                    fbank_feature[:,:max(fbank_feature_len),:],
-                    fbank_feature_len
-                )
+                with torch.set_grad_enabled(not freeze_encoder):
+                    audio_embeds, encoder_out_lens, middle_out = self.audio_encoder.forward_encoder(
+                        fbank_feature[:,:max(fbank_feature_len),:],
+                        fbank_feature_len
+                    )
                 if self.concat_encoder_features:
                     # assert not self.weighted_sum_encoder
                     # NOTE: maybe this layer norm is not necessary, but we keep it this way for now
@@ -366,15 +551,26 @@ class SALMONN(PreTrainedModel):
                     middle_out = torch.cat(middle_out, dim=-1) # (N,T,num_layers * C)
                     audio_embeds = self.concat_proj(middle_out) # (N,T,C)
                 audio_embeds = self.ln_audio(audio_embeds)
+            if self.encoder_type == "spear_transformer":
+                with torch.set_grad_enabled(not freeze_encoder):
+                    audio_embeds, encoder_out_lens, middle_out = self.audio_encoder.forward_encoder(
+                        fbank_feature[:,:max(fbank_feature_len),:], 
+                        fbank_feature_len
+                    )
+                if self.concat_encoder_features:
+                    middle_out = [F.layer_norm(m, (m.shape[-1],)) for m in middle_out]
+                    middle_out = torch.cat(middle_out, dim=-1) # (N,T,num_layers * C)
+                    audio_embeds = self.concat_proj(middle_out) # (N,T,C)
+                audio_embeds = self.ln_audio(audio_embeds)
             elif self.encoder_type == "dasheng":
-                audio_embeds = self.audio_encoder(fbank_feature.transpose(1, 2)).hidden_states
+                with torch.set_grad_enabled(not freeze_encoder):
+                    audio_embeds = self.audio_encoder(fbank_feature.transpose(1, 2)).hidden_states
                 audio_embeds = self.ln_audio(audio_embeds)
             elif self.encoder_type == "dasheng_wavlm":
-                if self.freeze_encoder:
-                    with torch.no_grad():
-                        fbanks = self.fbank(fbank_feature, return_tensors="pt", device=fbank_feature.device).input_values
-                        audio_embeds = self.audio_encoder(fbanks.to(torch.bfloat16)).hidden_states
-                        speech_embeds = self.speech_encoder(fbank_feature).last_hidden_state
+                with torch.set_grad_enabled(not freeze_encoder):
+                    fbanks = self.fbank(fbank_feature, return_tensors="pt", device=fbank_feature.device).input_values
+                    audio_embeds = self.audio_encoder(fbanks.to(torch.bfloat16)).hidden_states
+                    speech_embeds = self.speech_encoder(fbank_feature).last_hidden_state
                 seqlen_audio = audio_embeds.size(1)
                 bsz, seqlen, ndim = speech_embeds.size()
                 if seqlen_audio * 2 > seqlen:
@@ -390,8 +586,9 @@ class SALMONN(PreTrainedModel):
                 audio_embeds = torch.cat([audio_embeds, speech_embeds], dim=-1)
                 audio_embeds = self.ln_audio(audio_embeds)
             elif self.encoder_type == "whisper_beats":
-                speech_embeds = self.speech_encoder(fbank_feature, return_dict=True).last_hidden_state
-                audio_embeds, _ = self.audio_encoder.extract_features(raw_wavs, padding_mask=torch.arange(raw_wavs.size(1)).unsqueeze(0).to(raw_wavs.device) >= fbank_feature_len.unsqueeze(1), feature_only=True)
+                with torch.set_grad_enabled(not freeze_encoder):
+                    speech_embeds = self.speech_encoder(fbank_feature, return_dict=True).last_hidden_state
+                    audio_embeds, _ = self.audio_encoder.extract_features(raw_wavs, padding_mask=torch.arange(raw_wavs.size(1)).unsqueeze(0).to(raw_wavs.device) >= fbank_feature_len.unsqueeze(1), feature_only=True)
                 if audio_embeds.size(1) < speech_embeds.size(1):
                     audio_embeds = F.pad(audio_embeds, (0, 0, 0, speech_embeds.size(1) - audio_embeds.size(1)))
                 elif audio_embeds.size(1) > speech_embeds.size(1):
@@ -400,27 +597,30 @@ class SALMONN(PreTrainedModel):
                 speech_embeds = self.ln_speech(speech_embeds)
                 audio_embeds = torch.cat([audio_embeds, speech_embeds], dim=-1)
             elif self.encoder_type == "whisper":
-                speech_embeds = self.audio_encoder(fbank_feature, return_dict=True).last_hidden_state
+                with torch.set_grad_enabled(not freeze_encoder):
+                    speech_embeds = self.audio_encoder(fbank_feature, return_dict=True).last_hidden_state
                 audio_embeds = self.ln_audio(speech_embeds)
             elif self.encoder_type == "qwenomni" or self.encoder_type == "qwen3omni":
                 fbank_feature = fbank_feature.permute(0, 2, 1)[raw_wavs.bool()].permute(1, 0)
-                if self.encoder_type == "qwenomni":
-                    audio_feat_lengths, audio_output_lengths = self.audio_encoder._get_feat_extract_output_lengths(raw_wavs.sum(-1))
-                    audio_outputs = self.audio_encoder(
-                        fbank_feature,
-                        feature_lens=raw_wavs.sum(-1),
-                        aftercnn_lens=audio_feat_lengths,
-                    )
-                elif self.encoder_type == "qwen3omni":
-                    audio_output_lengths = self._get_feat_extract_output_lengths(raw_wavs.sum(-1))
-                    audio_outputs = self.audio_encoder(
-                        fbank_feature,
-                        feature_lens=raw_wavs.sum(-1)
-                    )
+                with torch.set_grad_enabled(not freeze_encoder):
+                    if self.encoder_type == "qwenomni":
+                        audio_feat_lengths, audio_output_lengths = self.audio_encoder._get_feat_extract_output_lengths(raw_wavs.sum(-1))
+                        audio_outputs = self.audio_encoder(
+                            fbank_feature,
+                            feature_lens=raw_wavs.sum(-1),
+                            aftercnn_lens=audio_feat_lengths,
+                        )
+                    elif self.encoder_type == "qwen3omni":
+                        audio_output_lengths = self._get_feat_extract_output_lengths(raw_wavs.sum(-1))
+                        audio_outputs = self.audio_encoder(
+                            fbank_feature,
+                            feature_lens=raw_wavs.sum(-1)
+                        )
                 audio_embeds = rnn.pad_sequence(torch.split(audio_outputs.last_hidden_state, audio_output_lengths.tolist(), dim=0),batch_first=True)            
                 audio_embeds = self.ln_audio(audio_embeds)
             elif self.encoder_type == "mimo":
-                audio_embeds, _, encoder_output_length, _ = self.audio_encoder.encode(fbank_feature, fbank_feature_len, use_quantizer=False)
+                with torch.set_grad_enabled(not freeze_encoder):
+                    audio_embeds, _, encoder_output_length, _ = self.audio_encoder.encode(fbank_feature, fbank_feature_len, use_quantizer=False)
                 audio_embeds = self.ln_audio(audio_embeds)
             elif self.encoder_type == "perception_av":
                 with torch.inference_mode():
@@ -429,7 +629,8 @@ class SALMONN(PreTrainedModel):
                 encoder_output_length = encoder_outputs.audio_feature_padding_mask.sum(dim=-1)
                 audio_embeds = self.ln_audio(audio_embeds)
             elif self.encoder_type == "audio_flamingo":
-                encoder_outputs = self.audio_encoder(fbank_feature, input_features_mask=raw_wavs)
+                with torch.set_grad_enabled(not freeze_encoder):
+                    encoder_outputs = self.audio_encoder(fbank_feature, input_features_mask=raw_wavs)
                 audio_embeds = encoder_outputs.last_hidden_state
                 audio_embeds = self.ln_audio(audio_embeds)
 
@@ -454,6 +655,8 @@ class SALMONN(PreTrainedModel):
                 audio_embeds = self.connector(audio_embeds)
 
                 if self.encoder_type == "zipformer2":
+                    return audio_embeds, torch.ceil(encoder_out_lens/self.connector_seg_size).to(torch.int64)
+                elif self.encoder_type == "spear_transformer":
                     return audio_embeds, torch.ceil(encoder_out_lens/self.connector_seg_size).to(torch.int64)
                 elif self.encoder_type == "dasheng":
                     return audio_embeds, torch.ceil(fbank_feature_len/(4*self.connector_seg_size)).to(torch.int64)
@@ -524,6 +727,8 @@ class SALMONN(PreTrainedModel):
             bos_id = 128002
             padding_id = 128004
         audio_embeds, audio_embeds_lens = self.encode_audio(fbank_feature, fbank_feature_len, raw_wavs)
+        if self.inject_temporal_embedding:
+            audio_embeds, audio_embeds_lens = self.inject_temporal_embeddings(audio_embeds, audio_embeds_lens)
         _, seqlen, dim = audio_embeds.size()
         bsz = input_ids.shape[0]
         input_embeds_list = []
@@ -608,6 +813,7 @@ class SALMONN(PreTrainedModel):
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
+        # print(f"Current rank: {int(os.environ.get('RANK', 0))}, fbank_feature_len: {fbank_feature_len}")
         input_embeds, attention_mask, labels = self.prepare_inputs_labels_for_speech(
             input_ids, attention_mask, labels, fbank_feature, fbank_feature_len, raw_wavs
         )
