@@ -259,6 +259,16 @@ class SALMONN(PreTrainedModel):
         else:
             raise ValueError(f"Unsupported connector type: {model_args.connector_type}")
 
+        # ---------- pause thinking ----------
+        self.num_pause_steps = getattr(model_args, "num_pause_steps", 0)
+        self.distinct_pause_embed = getattr(model_args, "distinct_pause_embed", False)
+        if self.num_pause_steps > 0:
+            if self.distinct_pause_embed:
+                self.pause_embed = nn.Parameter(torch.zeros(self.num_pause_steps, config.hidden_size))
+            else:
+                self.pause_embed = nn.Parameter(torch.zeros(1, config.hidden_size))
+            print(f"[SALMONN] pause_thinking enabled, num_pause_steps={self.num_pause_steps}, distinct_pause_embed={self.distinct_pause_embed}")
+
         # ---------- temporal embedding injection ----------
         self.inject_temporal_embedding = getattr(model_args, "inject_temporal_embedding", False)
         self.temporal_granularity = getattr(model_args, "temporal_granularity", 0.5)
@@ -474,7 +484,7 @@ class SALMONN(PreTrainedModel):
         elif model_args.encoder_type == "spear_transformer":
             from spear_transformer_encoder.model import get_spear_transformer_encoder_600M
             audio_encoder = get_spear_transformer_encoder_600M()
-            audio_encoder.to(torch.bfloat16) # SPEAR transformer is trained in bfloat16, we hard set this to prevent error in inference
+            audio_encoder = audio_encoder.to(torch.bfloat16)
             
         elif model_args.encoder_type == "dasheng":
             from transformers import AutoModel
@@ -751,6 +761,27 @@ class SALMONN(PreTrainedModel):
                     current_labels = torch.cat((current_labels[:idx+1], torch.full((audio_len,), fill_value=-100, dtype=torch.long).to(current_labels.device),current_labels[idx+1:]),dim=0)
                     audio_num += 1
                     bos_idx += audio_len
+                if self.num_pause_steps > 0: 
+                    first_response_positions = (current_labels != -100).nonzero(as_tuple=True)[0]
+                    if len(first_response_positions) > 0:
+                        insert_at = first_response_positions[0].item()
+                        if self.distinct_pause_embed:
+                            pause_embeds = self.pause_embed.to(current_input_embeds.dtype)
+                        else:
+                            pause_embeds = self.pause_embed.to(current_input_embeds.dtype).expand(self.num_pause_steps, -1)
+                        current_input_embeds = torch.cat([
+                            current_input_embeds[:insert_at],
+                            pause_embeds,
+                            current_input_embeds[insert_at:]
+                        ], dim=0)
+                        pause_labels = torch.full(
+                            (self.num_pause_steps,), -100, dtype=torch.long, device=current_labels.device
+                        )
+                        current_labels = torch.cat([
+                            current_labels[:insert_at],
+                            pause_labels,
+                            current_labels[insert_at:]
+                        ], dim=0)
                 current_attention_mask = torch.ones((len(current_input_embeds),), dtype=torch.long).to(current_labels.device)
                 input_embeds_list.append(current_input_embeds)
                 attention_mask_list.append(current_attention_mask)
@@ -776,6 +807,14 @@ class SALMONN(PreTrainedModel):
                     padding_idx += audio_len
                 current_attention_mask = torch.ones((len(current_input_embeds),), dtype=torch.long).to(current_input_embeds.device)
                 current_attention_mask[padding_idx] = 0
+                if self.num_pause_steps > 0:
+                    if self.distinct_pause_embed:
+                        pause_embeds = self.pause_embed.to(current_input_embeds.dtype)
+                    else:
+                        pause_embeds = self.pause_embed.to(current_input_embeds.dtype).expand(self.num_pause_steps, -1)
+                    current_input_embeds = torch.cat([current_input_embeds, pause_embeds], dim=0)
+                    pause_mask = torch.ones((self.num_pause_steps,), dtype=torch.long).to(current_input_embeds.device)
+                    current_attention_mask = torch.cat([current_attention_mask, pause_mask], dim=0)
                 input_embeds_list.append(current_input_embeds)
                 attention_mask_list.append(current_attention_mask)
             input_embeds = rnn.pad_sequence(input_embeds_list, batch_first=True, padding_side="left")
