@@ -12,11 +12,9 @@ from lhotse import Fbank, FbankConfig
 from torchaudio.transforms import MelSpectrogram
 from transformers import AutoFeatureExtractor, WhisperFeatureExtractor, AutoProcessor
 import soundfile as sf
-from petrel_client.client import Client
-
 PETRELOSS_CONFIG = "/mnt/shared-storage-user/housiyuan/xiaoyu/petreloss.conf"
 
-def load_audio_from_petrel_oss(audio_path: str, client: Client):
+def load_audio_from_petrel_oss(audio_path: str, client):
     bytes_data = client.get(audio_path)
     waveform, orig_sr = torchaudio.load(io.BytesIO(bytes_data))
     return waveform, orig_sr
@@ -103,10 +101,13 @@ class SALMONN_Dataset(Dataset):
         elif encoder_type == "audio_flamingo":
             self.fbank = WhisperFeatureExtractor.from_pretrained("/mnt/bn/audio-visual-llm-data6/ckpts/audio-flamingo-3-hf")
 
-        self.client = Client(PETRELOSS_CONFIG)
+        self.client = None
 
     def _load_audio(self, audio: str):
         if audio.startswith("s3://"):
+            if self.client is None:
+                from petrel_client.client import Client
+                self.client = Client(PETRELOSS_CONFIG)
             return load_audio_from_petrel_oss(audio, self.client)
         else:
             return torchaudio.load(audio)
