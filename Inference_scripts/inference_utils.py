@@ -205,6 +205,7 @@ def get_model_args(checkpoint_path: str):
             lora_rank: int = 64
             lora_alpha: int = 64
             lora_dropout: float = 0.05
+            dora: bool = False
             llm_type: str = "Qwen"
             encoder_type: str = "dasheng_wavlm"
             audio_encoder_path: str = "/mnt/bn/audio-visual-llm-data6/wangsiyin/SALMONN/dasheng"
@@ -223,6 +224,7 @@ def get_model_args(checkpoint_path: str):
             lora_rank: int = 64
             lora_alpha: int = 64
             lora_dropout: float = 0.05
+            dora: bool = False
             llm_type: str = "Qwen"
             encoder_type: str = "whisper_beats"
             audio_encoder_path: str = "/mnt/bn/audio-visual-llm-data/tangchangli/beats/BEATs_iter3_plus_AS2M_finetuned_on_AS2M_cpt2.pt"
@@ -241,6 +243,7 @@ def get_model_args(checkpoint_path: str):
             lora_rank: int = 64
             lora_alpha: int = 64
             lora_dropout: float = 0.05
+            dora: bool = False
             llm_type: str = "Qwen"
             encoder_type: str = "whisper"
             audio_encoder_path: str = "/mnt/bn/audio-visual-llm-data/yuwenyi/ckpt/whisper/whisper_large_v2"
@@ -258,6 +261,7 @@ def get_model_args(checkpoint_path: str):
             lora_rank: int = 64
             lora_alpha: int = 64
             lora_dropout: float = 0.05
+            dora: bool = False
             llm_type: str = "Qwen"
             encoder_type: str = "qwen3omni"
             audio_encoder_path: str = "/mnt/bn/audio-visual-llm-data6/ckpts/Qwen3-Omni-30B-A3B-Instruct"
@@ -276,6 +280,7 @@ def get_model_args(checkpoint_path: str):
             lora_rank: int = 64
             lora_alpha: int = 64
             lora_dropout: float = 0.05
+            dora: bool = False
             llm_type: str = "Qwen"
             encoder_type: str = "qwenomni"
             audio_encoder_path: str = "/mnt/bn/audio-visual-llm-data5/wangsiyin/models/Qwen2.5-Omni-7B"
@@ -294,6 +299,7 @@ def get_model_args(checkpoint_path: str):
             lora_rank: int = 64
             lora_alpha: int = 64
             lora_dropout: float = 0.05
+            dora: bool = False
             llm_type: str = "Qwen"
             encoder_type: str = "mimo"
             audio_encoder_path: str = "/mnt/bn/audio-visual-llm-data6/ckpts/MiMo-Audio-Tokenizer"
@@ -312,6 +318,7 @@ def get_model_args(checkpoint_path: str):
             lora_rank: int = 64
             lora_alpha: int = 64
             lora_dropout: float = 0.05
+            dora: bool = False
             llm_type: str = "Qwen"
             encoder_type: str = "perception_av"
             audio_encoder_path: str = "/mnt/bn/audio-visual-llm-data6/ckpts/pe-av-large"
@@ -330,6 +337,7 @@ def get_model_args(checkpoint_path: str):
             lora_rank: int = 64
             lora_alpha: int = 64
             lora_dropout: float = 0.05
+            dora: bool = False
             llm_type: str = "Qwen"
             encoder_type: str = "audio_flamingo"
             audio_encoder_path: str = "/mnt/bn/audio-visual-llm-data6/ckpts/audio-flamingo-3-hf"
@@ -348,6 +356,7 @@ def get_model_args(checkpoint_path: str):
             lora_rank: int = 64
             lora_alpha: int = 64
             lora_dropout: float = 0.05
+            dora: bool = False
             llm_type: str = "Qwen"
             encoder_type: str = "spear_transformer"
             audio_encoder_path: str = ""
@@ -369,6 +378,7 @@ def get_model_args(checkpoint_path: str):
             lora_rank: int = 64
             lora_alpha: int = 64
             lora_dropout: float = 0.05
+            dora: bool = False
             llm_type: str = "Qwen"
             encoder_type: str = "zipformer2"
             audio_encoder_path: str = ""
@@ -380,5 +390,8 @@ def get_model_args(checkpoint_path: str):
             zipformer_version: str = "xlarge"
             expand_vocab: bool = False
             inject_temporal_embedding: bool = False
+            num_pause_steps: int = 0
+            distinct_pause_embed: bool = False
+            use_reasoning_network: bool = False
 
     return ModelArguments()

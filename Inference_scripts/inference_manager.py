@@ -12,7 +12,7 @@ import logging
 
 TOKENIZER_PATH="/mnt/shared-storage-gpfs2/brainllm2-share/xiaoyu/models/Qwen3-8B"
 
-override_keys = [
+OVERRIDE_KEYS = [
     "weighted_sum_encoder",
     "concat_encoder_features",
     "zipformer_version",
@@ -21,7 +21,11 @@ override_keys = [
     "connector_type",
     "expand_vocab",
     "inject_temporal_embedding",
+    "num_pause_steps",
+    "distinct_pause_embed",
+    "use_reasoning_network",
 ]
+
 
 def override_args(checkpoint_path: str, default_model_args):
     config_file = os.path.dirname(checkpoint_path) + "/config.json"
@@ -32,7 +36,7 @@ def override_args(checkpoint_path: str, default_model_args):
         config = json.load(f)
         model_args = config["model_args"]
     # we pre-define some keys to be overriden
-    for k in override_keys:
+    for k in OVERRIDE_KEYS:
         attr = model_args.get(k, None)
         if attr is not None:
             setattr(default_model_args, k, attr)
@@ -147,6 +151,9 @@ class InferenceManager:
             output_ids = generated_id.tolist()
             content = self.tokenizer.decode(output_ids, skip_special_tokens=True).strip("\n")
             cleaned_content = content.split("</think>")[-1].strip()
+            # TODO: fix this bug
+            if cleaned_content.startswith("<think>\n\n"):
+                cleaned_content = cleaned_content.replace("<think>\n\n", "", 1).strip()
             sample = batch_data[i]
             sample["response"] = cleaned_content
             json.dump(sample, out_file, ensure_ascii=False)

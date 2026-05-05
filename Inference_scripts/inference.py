@@ -18,6 +18,7 @@ class ModelArguments:
     lora_rank: int = 64
     lora_alpha: int = 64
     lora_dropout: float = 0.05
+    dora: bool = False
     encoder_type: str = "dasheng_wavlm" # zipformer2
     audio_encoder_path: str = "/mnt/bn/audio-visual-llm-data6/wangsiyin/SALMONN/dasheng" # ""
     speech_encoder_path: str = "/mnt/bn/audio-visual-llm-data6/wangsiyin/SALMONN/wavlm" # ""
