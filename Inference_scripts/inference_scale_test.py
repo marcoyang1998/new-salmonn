@@ -18,6 +18,7 @@ class ModelArguments:
     lora_rank: int = 64
     lora_alpha: int = 64
     lora_dropout: float = 0.05
+    dora: bool = False
     encoder_type: str = "zipformer2"
     audio_encoder_path: str = ""
     freeze_encoder: bool = True

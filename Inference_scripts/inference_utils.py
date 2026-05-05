@@ -393,5 +393,6 @@ def get_model_args(checkpoint_path: str):
             num_pause_steps: int = 0
             distinct_pause_embed: bool = False
             use_reasoning_network: bool = False
+            reasoning_network_dim: int = 1024
 
     return ModelArguments()

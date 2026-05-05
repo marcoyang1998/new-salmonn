@@ -27,7 +27,6 @@ QUESTION_TEMPLATE = (
     "For example, if you think the answer is Option A, please just output 'A'"
 )
 
-# Encoders that share the same Fbank config and chunking logic
 ZIPFORMER_LIKE = {"zipformer2", "spear_transformer"}
 
 OVERRIDE_KEYS = [
@@ -43,7 +42,6 @@ OVERRIDE_KEYS = [
     "distinct_pause_embed",
     "use_reasoning_network",
     "reasoning_network_dim",
-    "dora",
 ]
 
 
@@ -55,7 +53,6 @@ class ModelArguments:
     lora_rank: int = 64
     lora_alpha: int = 64
     lora_dropout: float = 0.05
-    dora: bool = False
     llm_type: str = "Qwen"
     encoder_type: str = "zipformer2"
     audio_encoder_path: str = ""
@@ -88,16 +85,15 @@ def str2bool(v):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Evaluate SALMONN on MMAU test/test-mini")
+    parser = argparse.ArgumentParser(description="Evaluate SALMONN on MMAR")
     parser.add_argument("--model_name_or_path", type=str, required=True,
                         help="Path to model checkpoint")
     parser.add_argument("--encoder_type", type=str, default=None,
-                        help="Audio encoder type (e.g. zipformer2, spear_transformer). "
-                             "If not set, value from checkpoint config.json is used.")
-    parser.add_argument("--mmau_json", type=str, required=True,
-                        help="Path to mmau-test.json or mmau-test-mini.json")
+                        help="Audio encoder type. If not set, value from checkpoint config.json is used.")
+    parser.add_argument("--mmar_json", type=str, required=True,
+                        help="Path to MMAR-meta.json")
     parser.add_argument("--audio_root", type=str, required=True,
-                        help="Root directory containing MMAU audio files")
+                        help="Root directory containing MMAR audio files")
     parser.add_argument("--output_path", type=str, required=True,
                         help="Path to write the annotated output JSON")
     parser.add_argument("--concat_encoder_features", type=str2bool, default=None)
@@ -157,14 +153,7 @@ def get_fbank(model_args):
 
 
 def extract_features(audio_path, fbank, model_args):
-    """Extract fbank features for a single audio file.
-
-    Returns:
-        feature: list of feature tensors
-        raw_wavs: list of raw waveform tensors (only for whisper_beats / qwenomni)
-        audio_nums: list of chunk counts per audio (only for split zipformer-like)
-        split_feature_lens: list of frame lengths for split chunks
-    """
+    """Extract fbank features for a single audio file."""
     audio_chunk = model_args.audio_chunk * 16000
     enc = model_args.encoder_type
 
@@ -271,13 +260,7 @@ def extract_predicted_letter(model_output_raw, choices):
     if m:
         return m.group(1).upper(), False
 
-    # Wrong format — check if output contains the text of a choice
-    output_lower = model_output_raw.lower()
-    matched_indices = [i for i, c in enumerate(choices) if c.strip().lower() in output_lower]
-    if len(matched_indices) == 1:
-        return LETTERS[matched_indices[0]], True
-
-    # Fall back to first letter found, default to 'A' if out of range
+    # Wrong format — fall back to first letter found, default to 'A' if out of range
     first = re.search(r"[A-Za-z]", model_output_raw)
     if first:
         candidate = first.group(0).upper()
@@ -294,7 +277,6 @@ def main():
     model_args.model_name_or_path = args.model_name_or_path
     model_args = override_args_from_config(args.model_name_or_path, model_args)
 
-    # Explicit CLI arguments override config values
     if args.encoder_type is not None:
         model_args.encoder_type = args.encoder_type
     if args.concat_encoder_features is not None:
@@ -302,7 +284,6 @@ def main():
 
     print(f"Encoder type: {model_args.encoder_type}")
 
-    # Load tokenizer and model
     if model_args.llm_type == "Qwen":
         tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path)
     elif model_args.llm_type == "Llama":
@@ -321,8 +302,7 @@ def main():
 
     fbank = get_fbank(model_args)
 
-    # Load MMAU data
-    with open(args.mmau_json) as f:
+    with open(args.mmar_json) as f:
         data = json.load(f)
 
     total_questions = len(data)
@@ -334,16 +314,14 @@ def main():
         choices = item["choices"]
         prompt = build_prompt(item["question"], choices)
 
-        rel = item["audio_id"].lstrip("./")
+        rel = item["audio_path"].lstrip("./")
         audio_path = os.path.join(args.audio_root, rel)
 
         messages = [{"role": "user", "content": "<audio>" + prompt}]
-        # For regular model, enable_thinking is False in default decoding False
         text = tokenizer.apply_chat_template(
-            messages, 
+            messages,
             tokenize=False,
             add_generation_prompt=True,
-            enable_thinking=True, # TODO: in the training code, the pause embed is injected before <think>
         )
 
         feature, raw_wavs, audio_nums, split_feature_lens = extract_features(audio_path, fbank, model_args)
@@ -391,16 +369,11 @@ def main():
             correct_answers += 1
 
         if i % 100 == 0 and i:
-            evaluated = sum(1 for d in data[:i] if d.get("answer", ""))
-            if evaluated > 0:
-                print(
-                    f"[{i}/{total_questions}] accuracy: {correct_answers}/{evaluated} "
-                    f"({correct_answers/evaluated:.2%}), wrong format: {wrong_format_answers}"
-                )
-            else:
-                print(f"[{i}/{total_questions}] no ground truth yet, wrong format: {wrong_format_answers}")
+            print(
+                f"[{i}/{total_questions}] accuracy: {correct_answers}/{i} "
+                f"({correct_answers/i:.2%}), wrong format: {wrong_format_answers}"
+            )
 
-    # Write annotated output
     os.makedirs(os.path.dirname(os.path.abspath(args.output_path)), exist_ok=True)
     with open(args.output_path, "w") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)

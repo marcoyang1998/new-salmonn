@@ -24,6 +24,7 @@ OVERRIDE_KEYS = [
     "num_pause_steps",
     "distinct_pause_embed",
     "use_reasoning_network",
+    "reasoning_network_dim",
 ]
 
 
