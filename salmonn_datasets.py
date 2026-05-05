@@ -3,6 +3,8 @@ import io
 import json
 import math
 import random
+import string
+from typing import List, Dict
 
 import torch
 import torchaudio
@@ -28,10 +30,11 @@ class SALMONN_Dataset(Dataset):
         if encoder_type == "whisper_beats" or encoder_type == "audio_flamingo":
             self.max_frames = 30 * 16000
         else:
-            self.max_frames = 120 * 16000
+            self.max_frames = 120 * 16000 # TODO: make the longest accept duration configurable
         audio_chunk = getattr(args, "audio_chunk", 60)
         self.audio_chunk = audio_chunk * 16000 # TODO: make this optional
         self.split_audio = args.split_audio
+        self.shuffle_mc_options = bool(getattr(args, "shuffle_mc_options", True))
 
         self.data = json.load(open(args.data_path, "r"))["data"]
 
@@ -65,6 +68,19 @@ class SALMONN_Dataset(Dataset):
             )
         else:
             print(f"[Dataset] max_audio_duration disabled — keeping all {len(self.data):,} entries.", flush=True)
+
+        min_dur = getattr(args, "min_audio_duration", 0.1)
+        before_count = len(self.data)
+        self.data = [
+            e for e in self.data
+            if all(d >= min_dur for d in e.get("durations", []) if d >= 0)
+        ]
+        removed = before_count - len(self.data)
+        print(
+            f"[Dataset] min_audio_duration={min_dur}s — "
+            f"removed {removed:,} / {before_count:,} entries.",
+            flush=True,
+        )
 
         # lengths[i] = max audio duration (seconds) across all audios in sample i.
         # Used by AudioLengthGroupedSampler when group_by_audio_length=True.
@@ -102,6 +118,8 @@ class SALMONN_Dataset(Dataset):
             self.fbank = WhisperFeatureExtractor.from_pretrained("/mnt/bn/audio-visual-llm-data6/ckpts/audio-flamingo-3-hf")
 
         self.client = None
+        self._broken_audio_paths = set()
+        self.broken_sample_max_retries = max(1, int(getattr(args, "broken_sample_max_retries", 32)))
 
     def _load_audio(self, audio: str):
         if audio.startswith("s3://"):
@@ -115,9 +133,97 @@ class SALMONN_Dataset(Dataset):
     def __len__(self):
         return len(self.data)
 
-    def __getitem__(self, index):
-        sample = self.data[index]
+    def _option_label(self, index):
+        if index < len(string.ascii_uppercase):
+            return string.ascii_uppercase[index]
+        return str(index + 1)
 
+    def _build_mc_messages(self, sample):
+        options = sample.get("mc_options")
+        question = sample.get("mc_question")
+        if options is None or question is None:
+            return sample["messages"]
+
+        if len(options) > 0 and isinstance(options[0], dict):
+            if any("is_correct" in option for option in options):
+                option_items = [
+                    {
+                        "content": option["content"],
+                        "is_correct": bool(option.get("is_correct", False)),
+                    }
+                    for option in options
+                ]
+            else:
+                answer_label = sample.get("mc_answer_label", "")
+                option_items = [
+                    {
+                        "content": option["content"],
+                        "is_correct": option.get("label", "") == answer_label,
+                    }
+                    for option in options
+                ]
+        else:
+            answer_index = int(sample.get("mc_answer_index", -1))
+            option_items = [
+                {
+                    "content": option_text,
+                    "is_correct": idx == answer_index,
+                }
+                for idx, option_text in enumerate(options)
+            ]
+
+        if self.shuffle_mc_options:
+            random.shuffle(option_items)
+
+        lines = [
+            "<audio>Listen to the audio and answer the following multiple-choice question.",
+            f"Question: {question.strip()}",
+            "Choices:",
+        ]
+        answer_label = None
+        for idx, option in enumerate(option_items):
+            label = self._option_label(idx)
+            lines.append(f"Option {label}: {option['content']}")
+            if option["is_correct"]:
+                answer_label = label
+        lines.append("")
+        lines.append('Please output your final answer with a single letter. For example, if you think the answer is Option A, please just output \'A\'.')
+
+        if answer_label is None:
+            raise ValueError("Cannot determine correct answer for multiple-choice sample.")
+
+        return [
+            {
+                "role": "user",
+                "content": "\n".join(lines),
+            },
+            {
+                "role": "assistant",
+                "content": answer_label,
+            },
+        ]
+    
+    def _verify_chat(self, chats: List[Dict]):
+        assert len(chats) == 2, f"Chat should have exactly 2 messages, but got {len(chats)}: {chats}"
+        assert "<audio>" in chats[0]["content"], f"The first message should contain the audio placeholder, but got: {chats}"
+    
+    def __getitem__(self, index):
+        for attempt in range(self.broken_sample_max_retries):
+            sample_index = index if attempt == 0 else random.randint(0, len(self.data) - 1)
+            sample = self.data[sample_index]
+            try:
+                result = self._load_sample(sample)
+                return result
+            except Exception as e:
+                for audio_path in sample.get("audios", []):
+                    if audio_path not in self._broken_audio_paths:
+                        print(f"[WARN] Broken audio detected and skipped: {audio_path}; error={repr(e)}", flush=True)
+                        self._broken_audio_paths.add(audio_path)
+        raise RuntimeError(
+            f"Failed to fetch a valid sample after {self.broken_sample_max_retries} retries due to broken audio files."
+        )
+
+    def _load_sample(self, sample):
         fbanks = []
         fbank_lens = []
         raw_wavs = []
@@ -205,7 +311,13 @@ class SALMONN_Dataset(Dataset):
                 raw_wavs.append(inputs["attention_mask"].squeeze())
                 fbank_lens.append(inputs["attention_mask"].sum(-1))
         
+        if sample.get("task_type") == "qa_mc" and "mc_options" in sample and "mc_question" in sample:
+            chats = self._build_mc_messages(sample)
+        else:
+            chats = sample["messages"]
+        
         chats = sample["messages"]
+        self._verify_chat(chats)
         text = self.tokenizer.apply_chat_template(chats,tokenize=False)
         if self.llm_type == "Qwen":
             if self.split_audio and len(audio_nums) > 0:
