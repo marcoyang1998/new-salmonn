@@ -15,7 +15,7 @@ from transformers import AutoConfig, AutoTokenizer, Trainer, TrainerCallback
 from torch.utils.data import Sampler
 
 from modeling_salmonn import SALMONN
-from datasets import SALMONN_Dataset
+from salmonn_datasets import SALMONN_Dataset
 
 @dataclass
 class ModelArguments:
@@ -27,6 +27,7 @@ class ModelArguments:
     lora_rank: int = field(default=64)
     lora_alpha: int = field(default=64)
     lora_dropout: float = field(default=0.05)
+    dora: bool = field(default=False)
     encoder_type: str = field(default="zipformer2")
     audio_encoder_path: str = field(default="/mnt/bn/audio-visual-llm-data6/ckpts/spear-encoder-streaming-600M-speech-only/spear-xlarge-non-streaming/iter-448000-avg-2.pt")
     speech_encoder_path: str = field(default="/mnt/bn/audio-visual-llm-data6/wangsiyin/SALMONN/wavlm")
@@ -38,15 +39,22 @@ class ModelArguments:
     encoder_lora: bool = field(default=False)
     encoder_lora_rank: int = field(default=16)
     expand_vocab: bool = field(default=False)
+    freeze_llm: bool = field(default=False, metadata={"help": "Freeze all base_llm parameters. Incompatible with lora=True or expand_vocab=True."})
     inject_temporal_embedding: bool = field(default=False)
     temporal_granularity: float = field(default=0.5, metadata={"help": "Timestamp injection granularity in seconds (e.g. 0.5 → <|0.50|> every 0.5 s)."})
-    encoder_frame_rate: int = field(default=50, metadata={"help": "Audio encoder output frame rate in Hz before the connector (e.g. 50 for SpEAR/zipformer2)."})
+    encoder_frame_rate: int = field(default=50, metadata={"help": "Audio encoder output frame rate in Hz before the connector (e.g. 50 for SPEAR/zipformer2)."})
+    use_reasoning_network: bool = field(default=False, metadata={"help": "Whether to insert a reasoning network between the audio encoder and LLM, taking the audio encoder output as input and producing new 'reasoning' tokens to insert into the LLM input. If False, reasoning_network is not used and num_pause_steps just controls how many <PAUSE> tokens are inserted with no additional reasoning features."})
+    reasoning_network_num_layers: int = field(default=5, metadata={"help": "Number of transformer layers in the reasoning network (if use_reasoning_network is True)."})
+    reasoning_network_dim: int = field(default=1024, metadata={"help": "Hidden dimension of the reasoning network (if use_reasoning_network is True). Defaults to the LLM hidden size if not set."})
+    num_pause_steps: int = field(default=0, metadata={"help": "Number of <PAUSE> tokens to insert before decoding"})
+    distinct_pause_embed: bool = field(default=False, metadata={"help": "Whether to use distinct embeddings for each <PAUSE> token when num_pause_steps > 0. If False, all <PAUSE> tokens share the same embedding."})
 
 @dataclass
 class DataArguments:
     data_path: Optional[str] = field(default="")
     split_audio: bool = field(default=False)
     audio_chunk: int = field(default=60, metadata={"help": "Audio chunk size in seconds when split_audio is True."})
+    shuffle_mc_options: bool = field(default=True)
     max_audio_duration: float = field(
         default=-1,
         metadata={"help": "Maximum audio duration in seconds. Entries with any audio longer than this are "
