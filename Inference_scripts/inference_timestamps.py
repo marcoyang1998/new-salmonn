@@ -1,11 +1,10 @@
+import argparse
 import io
 import json
 import math
-import re
 import warnings
-import argparse
+from tqdm import tqdm
 
-from dataclasses import dataclass, field, asdict
 from modeling_salmonn import SALMONN
 from lhotse import Fbank, FbankConfig
 from transformers import AutoConfig, AutoTokenizer
@@ -16,6 +15,7 @@ from lhotse import Fbank, FbankConfig
 from transformers import AutoFeatureExtractor
 import os
 import soundfile as sf
+from inference_utils import override_args_from_config
 
 from petrel_client.client import Client
 
@@ -55,6 +55,25 @@ class ModelArguments:
     split_audio: bool = True
     audio_chunk: int = 120
     expand_vocab: bool = False
+    inject_temporal_embedding: bool = False
+    inject_temporal_embedding_nl: bool = False
+    temporal_granularity: float = 1.0
+    encoder_frame_rate: int = 50
+    use_reasoning_network: bool = False
+    reasoning_network_num_layers: int = 5
+    reasoning_network_dim: int = 1024
+    num_pause_steps: int = 0
+    distinct_pause_embed: bool = False
+
+
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if v.lower() in ("yes", "true", "t", "y", "1"):
+        return True
+    if v.lower() in ("no", "false", "f", "n", "0"):
+        return False
+    raise argparse.ArgumentTypeError("Boolean value expected.")
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run QA inference with SALMONN")
@@ -65,37 +84,35 @@ def parse_args():
         help="Path to model checkpoint",
     )
     parser.add_argument(
-        "--concat_encoder_features",
-        action="store_true",
-    )
-    parser.add_argument(
-        "--expand_vocab",
-        action="store_true",
-    )
-    parser.add_argument(
         "--test_json",
         type=str,
         required=True,
     )
     parser.add_argument(
-        "--connector-seg-size",
-        type=int,
-        default=5,
+        "--output_json",
+        type=str,
+        required=True,
+        help="Path to save output JSON with model_prediction added.",
     )
     return parser.parse_args()
 
 model_args = ModelArguments()
 args = parse_args()
 model_args.model_name_or_path = args.model_name_or_path
-model_args.concat_encoder_features = args.concat_encoder_features
-model_args.connector_seg_size = args.connector_seg_size
-model_args.expand_vocab = args.expand_vocab
+
+# Load latest model args from checkpoint config, then apply explicit CLI overrides.
+model_args = override_args_from_config(args.model_name_or_path, model_args)
 
 # load data
 json_file = args.test_json
 print(f"Loading test data from {json_file}...")
 with open(json_file, "r") as f:
-    data = json.load(f)["data"]
+    json_obj = json.load(f)
+
+if isinstance(json_obj, dict) and "data" in json_obj:
+    data = json_obj["data"]
+else:
+    data = json_obj
 
 if model_args.llm_type == "Qwen":
     tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path)
@@ -109,8 +126,12 @@ model = SALMONN.from_pretrained(
     torch_dtype="auto",
     device_map="auto"
 )
+if getattr(model_args, "inject_temporal_embedding", False):
+    model.register_temporal_tokens(tokenizer)
+if getattr(model_args, "inject_temporal_embedding_nl", False):
+    model.register_nl_timestamp_tokenizer(tokenizer)
 model.eval()
-if model_args.encoder_type == "zipformer2":
+if model_args.encoder_type in ("zipformer2", "spear_transformer"):
     fbank = Fbank(FbankConfig(num_mel_bins=128))
 elif model_args.encoder_type == "dasheng":
     fbank = AutoFeatureExtractor.from_pretrained("/mnt/bn/audio-visual-llm-data6/wangsiyin/SALMONN/dasheng", trust_remote_code=True)
@@ -124,17 +145,9 @@ elif model_args.encoder_type == "mimo":
     from torchaudio.transforms import MelSpectrogram
     fbank = MelSpectrogram(sample_rate=24000, n_fft=960, hop_length=240, win_length=960, power=1.0, center=True)
 
-
-
-single_letter_pattern = re.compile(r"^[A-Za-z]$")
-option_letter_pattern = re.compile(r"^Option\s+([A-Za-z])$", re.IGNORECASE)
-total_questions = len(data)
-correct_answers = 0
-wrong_format_answers = 0
 audio_chunk = model_args.audio_chunk * 16000
 
-
-for i, item in enumerate(data):
+for i, item in enumerate(tqdm(data)):
     # user prompt already contains the <audio>
     prompt = item["messages"][0]["content"]    
 
@@ -149,12 +162,6 @@ for i, item in enumerate(data):
         tokenize=False,
         add_generation_prompt=True
     )
-
-    # info = torchaudio.info(audio_paths[0])
-    # audio_duration =  info.num_frames / info.sample_rate
-    # if audio_duration > 120:
-    #     print(f"Audio {audio_paths[0]} duration {audio_duration:.2f}s exceeds model's maximum input length. Skipping this question.")
-    #     continue
     
     feature = []
     raw_wavs = []
@@ -166,7 +173,7 @@ for i, item in enumerate(data):
         if fs != 16000:
             audio = torchaudio.functional.resample(audio, fs, 16000)
             fs = 16000
-        if model_args.encoder_type == "zipformer2":
+        if model_args.encoder_type in ("zipformer2", "spear_transformer"):
             if model_args.split_audio and audio.shape[-1] > audio_chunk:
                 if audio.size(0) > 1:
                     audio = audio.mean(dim=0, keepdim=True)
@@ -215,12 +222,12 @@ for i, item in enumerate(data):
             spec = fbank(audio[None, :])
             mel = torch.log(torch.clip(spec, min=1e-7)).squeeze().transpose(0, 1)
             feature.append(mel)
-    print(prompt)
-    print(audio_paths)
+    # print(prompt)
+    # print(audio_paths)
 
     if model_args.encoder_type == "whisper_beats":
         feature_lens = [f.size(0) for f in raw_wavs]
-    elif model_args.encoder_type == "zipformer2" and model_args.split_audio and len(audio_nums) > 0:
+    elif model_args.encoder_type in ("zipformer2", "spear_transformer") and model_args.split_audio and len(audio_nums) > 0:
         feature_lens = split_feature_lens
     else:
         feature_lens = [f.size(0) for f in feature]
@@ -246,6 +253,7 @@ for i, item in enumerate(data):
         fbank_feature=feature,
         fbank_feature_len=feature_lens,
         raw_wavs=raw_wavs,
+        user_prompts=[prompt],
         max_new_tokens=500
     )
     
@@ -258,28 +266,31 @@ for i, item in enumerate(data):
         index = 0
     
     # since we expanded the vocab, we do not skip special tokens
-    thinking_content = tokenizer.decode(output_ids[:index], skip_special_tokens=False).strip("\n")
-    content = tokenizer.decode(output_ids[index:], skip_special_tokens=False).strip("\n") 
+    if model_args.expand_vocab:
+        thinking_content = tokenizer.decode(output_ids[:index], skip_special_tokens=False).strip("\n")
+        content = tokenizer.decode(output_ids[index:], skip_special_tokens=False).strip("\n")
+        content = content.replace("<|im_end|>", "")
+    else:
+        thinking_content = tokenizer.decode(output_ids[:index], skip_special_tokens=True).strip("\n")
+        content = tokenizer.decode(output_ids[index:], skip_special_tokens=True).strip("\n") 
 
     model_output = content.strip()
     model_output = model_output.strip(".")
+    item["model_prediction"] = model_output
     ground_truth = str(item["messages"][1]["content"]).strip()
-    print(f"model_output: {model_output}")
-    print(f"ground_truth: {ground_truth}")
-    
-    import pdb; pdb.set_trace()
-    if i % 100 == 0 and i:
-        print(f"Processed {i}/{total_questions} questions. Current accuracy: {correct_answers}/{i} ({correct_answers/i:.2%}), Wrong format answers: {wrong_format_answers}")
-    
+    # print(f"model_output: {model_output}")
+    # print(f"ground_truth: {ground_truth}")    
 
     # content = tokenizer.decode(output_ids, skip_special_tokens=True).strip("\n")
     # print(f"Model output: {content}, correct answer: {item['text']}")
 
-accuracy = correct_answers / total_questions if total_questions > 0 else 0.0
-checkpoint_name = os.path.basename(os.path.normpath(model_args.model_name_or_path))
-print("\n===== Inference Summary =====")
-print(f"0) Model checkpoint path: {model_args.model_name_or_path}")
-print(f"0.1) Model checkpoint name: {checkpoint_name}")
-print(f"1) Total number of questions: {total_questions}")
-print(f"2) Correctly answered questions: {correct_answers} ({accuracy:.2%})")
-print(f"3) Questions answered with wrong format: {wrong_format_answers}")
+# Save predictions into output JSON using the input JSON as base.
+output_path = args.output_json
+os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+with open(output_path, "w") as f:
+    if isinstance(json_obj, dict) and "data" in json_obj:
+        json_obj["data"] = data
+        json.dump(json_obj, f, indent=2, ensure_ascii=False)
+    else:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+print(f"Saved predictions to {output_path}")

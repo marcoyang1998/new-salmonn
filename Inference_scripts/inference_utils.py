@@ -5,6 +5,55 @@ import torch.nn.functional as F
 from transformers import AutoTokenizer, AutoFeatureExtractor
 import soundfile as sf
 import math
+import json
+import logging
+import os
+
+OVERRIDE_KEYS = [
+    "weighted_sum_encoder",
+    "concat_encoder_features",
+    "zipformer_version",
+    "connector_hid_size",
+    "connector_seg_size",
+    "connector_type",
+    "expand_vocab",
+    "inject_temporal_embedding",
+    "inject_temporal_embedding_nl",
+    "temporal_granularity",
+    "num_pause_steps",
+    "distinct_pause_embed",
+    "use_reasoning_network",
+    "use_qwen3_embedding_model",
+    "qwen3_embedding_model_path",
+    "qwen3_embedding_tokenizer_path",
+    "qwen3_embedding_max_length",
+    "freeze_qwen3_embedding_model",
+    "reasoning_network_num_layers",
+    "reasoning_network_dim",
+    "lora",
+    "dora",
+    "encoder_type",
+    "encoder_lora",
+    "encoder_lora_rank",
+    "encoder_lora_alpha",
+    "encoder_lora_dropout",
+]
+
+
+def override_args_from_config(checkpoint_path: str, model_args):
+    config_file = os.path.join(os.path.dirname(checkpoint_path), "config.json")
+    if not os.path.exists(config_file):
+        logging.warning(f"Config file {config_file} not found. Using default model args.")
+        return model_args
+    with open(config_file) as f:
+        config = json.load(f)
+    saved = config.get("model_args", {})
+    for k in OVERRIDE_KEYS:
+        val = saved.get(k)
+        if val is not None:
+            setattr(model_args, k, val)
+            print(f"Setting {k} to {val} from checkpoint config.")
+    return model_args
 
 audio_chunk = 30 * 16000
 max_frames = 120 * 16000

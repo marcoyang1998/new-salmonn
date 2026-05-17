@@ -41,6 +41,7 @@ class ModelArguments:
     expand_vocab: bool = field(default=False)
     freeze_llm: bool = field(default=False, metadata={"help": "Freeze all base_llm parameters. Incompatible with lora=True or expand_vocab=True."})
     inject_temporal_embedding: bool = field(default=False)
+    inject_temporal_embedding_nl: bool = field(default=False)
     temporal_granularity: float = field(default=0.5, metadata={"help": "Timestamp injection granularity in seconds (e.g. 0.5 → <|0.50|> every 0.5 s)."})
     encoder_frame_rate: int = field(default=50, metadata={"help": "Audio encoder output frame rate in Hz before the connector (e.g. 50 for SPEAR/zipformer2)."})
     use_reasoning_network: bool = field(default=False, metadata={"help": "Whether to insert a reasoning network between the audio encoder and LLM, taking the audio encoder output as input and producing new 'reasoning' tokens to insert into the LLM input. If False, reasoning_network is not used and num_pause_steps just controls how many <PAUSE> tokens are inserted with no additional reasoning features."})
@@ -119,6 +120,8 @@ def load_model_and_dataset(model_args, data_args, training_args):
     dataset = SALMONN_Dataset(data_args, tokenizer, model_args.encoder_type, model_args.llm_type)
     if model_args.inject_temporal_embedding:
         model.register_temporal_tokens(tokenizer)
+    if getattr(model_args, "inject_temporal_embedding_nl", False):
+        model.register_nl_timestamp_tokenizer(tokenizer)
     return tokenizer, model, dataset
 
 def main():

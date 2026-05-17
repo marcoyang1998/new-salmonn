@@ -21,6 +21,9 @@ OVERRIDE_KEYS = [
     "connector_type",
     "expand_vocab",
     "inject_temporal_embedding",
+    "inject_temporal_embedding_nl",
+    "temporal_granularity",
+    "encoder_frame_rate",
     "num_pause_steps",
     "distinct_pause_embed",
     "use_reasoning_network",
@@ -94,6 +97,8 @@ class InferenceManager:
         )
         if self.model_args.inject_temporal_embedding:
             model.register_temporal_tokens(self.tokenizer)
+        if getattr(self.model_args, "inject_temporal_embedding_nl", False):
+            model.register_nl_timestamp_tokenizer(self.tokenizer)
         model.eval()
         return model
 
