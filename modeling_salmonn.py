@@ -1,6 +1,9 @@
 import os
 import sys
+import contextlib
 
+from sentence_transformers import SentenceTransformer
+from sentence_transformers.util import batch_to_device
 from transformers import PreTrainedModel, AutoModelForCausalLM, StoppingCriteriaList, StoppingCriteria, AutoFeatureExtractor
 from peft import LoraConfig, TaskType, get_peft_model
 import torch
@@ -165,14 +168,6 @@ class SALMONN(PreTrainedModel):
                     strict=False,
                 )
                 print(f"Loading info: {info}")
-        if model_args.freeze_encoder:
-            for name, param in self.audio_encoder.named_parameters():
-                param.requires_grad = False
-            self.audio_encoder.eval()
-            if self.encoder_type == "dasheng_wavlm" or self.encoder_type == "whisper_beats":
-                for name, param in self.speech_encoder.named_parameters():
-                    param.requires_grad = False
-                self.speech_encoder.eval()
         encoder_lora = getattr(model_args, "encoder_lora", False)
         if model_args.encoder_type == "zipformer2" and encoder_lora:
             for name, param in self.audio_encoder.named_parameters():
@@ -182,6 +177,28 @@ class SALMONN(PreTrainedModel):
                     param.requires_grad = False
             # we decided not to set to eval()
             # self.audio_encoder.eval()
+        elif model_args.encoder_type == "spear_transformer" and encoder_lora:
+            encoder_lora_config = LoraConfig(
+                r=model_args.encoder_lora_rank,
+                lora_alpha=model_args.encoder_lora_alpha,
+                lora_dropout=model_args.encoder_lora_dropout,
+                target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                                "gate_proj", "up_proj", "down_proj"],
+                inference_mode=False,
+            )
+            self.audio_encoder = get_peft_model(self.audio_encoder, encoder_lora_config)
+            for name, param in self.audio_encoder.named_parameters():
+                param.requires_grad = "lora_" in name
+            # do not call eval() — same rationale as zipformer2 path above
+        # This will freeze all encoder parameters, no matter if it's a LoRA or not
+        if model_args.freeze_encoder:
+            for name, param in self.audio_encoder.named_parameters():
+                param.requires_grad = False
+            self.audio_encoder.eval()
+            if self.encoder_type == "dasheng_wavlm" or self.encoder_type == "whisper_beats":
+                for name, param in self.speech_encoder.named_parameters():
+                    param.requires_grad = False
+                self.speech_encoder.eval()
         # _encoder_frozen can be toggled at runtime (e.g. by EncoderUnfreezeCallback)
         # without changing requires_grad, using torch.set_grad_enabled in encode_audio.
         self._encoder_frozen = model_args.freeze_encoder
@@ -279,15 +296,50 @@ class SALMONN(PreTrainedModel):
         self.num_pause_steps = getattr(model_args, "num_pause_steps", 0)
         self.distinct_pause_embed = getattr(model_args, "distinct_pause_embed", False)
         self.use_reasoning_network = getattr(model_args, "use_reasoning_network", False)
+        self.use_qwen3_embedding_model = getattr(model_args, "use_qwen3_embedding_model", False)
+        self.qwen3_embedding_model = None
+        self.qwen3_embedding_max_length = getattr(model_args, "qwen3_embedding_max_length", 2048)
+        self.freeze_qwen3_embedding_model = getattr(model_args, "freeze_qwen3_embedding_model", True)
         if self.num_pause_steps > 0:
             if self.use_reasoning_network:
+                user_prompt_embed_dim = config.hidden_size
+                if self.use_qwen3_embedding_model:
+                    qwen3_embedding_model_path = getattr(model_args, "qwen3_embedding_model_path", "")
+                    if not qwen3_embedding_model_path:
+                        raise ValueError(
+                            "use_qwen3_embedding_model=True requires qwen3_embedding_model_path to be set."
+                        )
+                    model_kwargs = {"torch_dtype": config.torch_dtype}
+                    if getattr(config, "attn_implementation", None) is not None:
+                        model_kwargs["attn_implementation"] = config.attn_implementation
+                    self.qwen3_embedding_model = SentenceTransformer(
+                        qwen3_embedding_model_path,
+                        local_files_only=True,
+                        model_kwargs={"attn_implementation": "flash_attention_2", "device_map": "auto"},
+                        tokenizer_kwargs={"padding_side": "left"},
+                    )
+                    user_prompt_embed_dim = self.qwen3_embedding_model.get_sentence_embedding_dimension()
+                    if self.qwen3_embedding_model.max_seq_length is not None:
+                        self.qwen3_embedding_max_length = min(
+                            self.qwen3_embedding_max_length,
+                            self.qwen3_embedding_model.max_seq_length,
+                        )
+                    self.qwen3_embedding_model.max_seq_length = self.qwen3_embedding_max_length
+                    if self.freeze_qwen3_embedding_model:
+                        for param in self.qwen3_embedding_model.parameters():
+                            param.requires_grad_(False)
+                        self.qwen3_embedding_model.eval()
+                    print(
+                        f"[SALMONN] use_qwen3_embedding_model=True, hidden_size={user_prompt_embed_dim}, "
+                        f"max_length={self.qwen3_embedding_max_length}, frozen={self.freeze_qwen3_embedding_model}"
+                    )
                 num_layers = getattr(model_args, "reasoning_network_num_layers", 5)
                 reasoning_network_dim = getattr(model_args, "reasoning_network_dim", 1024)
                 self.reasoning_network = ReasoningNetwork(
                     num_queries=self.num_pause_steps,
                     d_model=reasoning_network_dim,
                     num_layers=num_layers,
-                    text_embed_dim=config.hidden_size,
+                    text_embed_dim=user_prompt_embed_dim,
                     audio_embed_dim=config.hidden_size,
                 )
                 self.post_reasoning_proj = nn.Linear(self.reasoning_network.d_model, config.hidden_size)
@@ -497,7 +549,6 @@ class SALMONN(PreTrainedModel):
         ts_lens_t = torch.tensor(ts_lens, dtype=torch.long, device=audio_embeds.device)
         ts_cumsum = torch.cumsum(ts_lens_t, dim=0)                         # (num_blocks,)
         num_valid_blocks = (audio_embeds_lens + K - 1) // K                # (bsz,)
-        num_valid_blocks = (audio_embeds_lens + K - 1) // K
         num_valid_blocks = num_valid_blocks.clamp(1, num_blocks)
         new_audio_embeds_lens = audio_embeds_lens + ts_cumsum[num_valid_blocks - 1]
 
@@ -870,11 +921,252 @@ class SALMONN(PreTrainedModel):
         output_lengths = ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (input_lengths // 100) * 13
         return output_lengths
 
-    def prepare_inputs_labels_for_speech(self, input_ids, attention_mask, labels, fbank_feature, fbank_feature_len, raw_wavs):
+    def _get_llm_user_prompt_embeds(self, current_input_embeds, sample_input_ids, bos_id, eos_id):
+        bos_idx = (sample_input_ids == bos_id).nonzero(as_tuple=True)[0]
+        eos_idx = (sample_input_ids == eos_id).nonzero(as_tuple=True)[0]
+        last_bos_idx = bos_idx[-1].item()
+        return current_input_embeds[last_bos_idx + 2:eos_idx[0]]
+
+    def _get_external_user_prompt_embeds(self, user_prompts, device):
+        if not self.use_qwen3_embedding_model:
+            return None
+        if user_prompts is None:
+            raise ValueError(
+                "user_prompts must be provided when use_qwen3_embedding_model=True."
+            )
+        features = self.qwen3_embedding_model.preprocess(inputs=user_prompts)
+        features = batch_to_device(features, device)
+        encoded_features = self.qwen3_embedding_model.forward(features)
+        embeddings = []
+        token_embeddings_batch = encoded_features["token_embeddings"]
+        attention_mask_batch = encoded_features["attention_mask"]
+        for token_embeddings, attention_mask in zip(token_embeddings_batch, attention_mask_batch):
+            attention_mask = attention_mask.to(dtype=torch.bool)
+            embeddings.append(token_embeddings[attention_mask].to(device))
+        return embeddings
+
+    def _get_external_user_prompt_embeds_via_encode(self, user_prompts, device):
+        if not self.use_qwen3_embedding_model:
+            return None
+        if user_prompts is None:
+            raise ValueError(
+                "user_prompts must be provided when use_qwen3_embedding_model=True."
+            )
+        prompt_name = None
+        embeddings = self.qwen3_embedding_model.encode(
+            user_prompts,
+            prompt_name=prompt_name,
+            output_value="token_embeddings",
+            convert_to_numpy=False,
+            convert_to_tensor=False,
+            device=device,
+            show_progress_bar=False,
+        )
+        return embeddings
+
+    def prepare_inputs_labels_for_speech_with_reasoning(
+        self,
+        input_ids,
+        labels,
+        audio_embeds,
+        audio_embeds_lens,
+        bos_id,
+        padding_id,
+        external_user_prompt_embeds=None,
+    ):
+        eos_id = 151645 if self.llm_type == "Qwen" else None
+        _, seqlen, _ = audio_embeds.size()
+        bsz = input_ids.shape[0]
+        input_embeds_list = []
+        attention_mask_list = []
+        audio_num = 0
+
+        if labels is not None:
+            labels_list = []
+            reasoning_audio_list = []
+            user_prompt_list = []
+            reasoning_insert_at = []
+            for i in range(bsz):
+                if is_peft_model(self.base_llm):
+                    current_input_embeds = self.base_llm.model.model.embed_tokens(input_ids[i].to(torch.int64))
+                else:
+                    current_input_embeds = self.base_llm.model.embed_tokens(input_ids[i].to(torch.int64))
+                current_labels = labels[i]
+                # find where currect_input_ids == bos_id, return all the index, this will be used for injecting audio embedding
+                bos_idx = (input_ids[i] == bos_id).nonzero(as_tuple=True)[0]
+                if self.use_qwen3_embedding_model:
+                    current_text_prompt_embed = external_user_prompt_embeds[i]
+                else:
+                    current_text_prompt_embed = self._get_llm_user_prompt_embeds(
+                        current_input_embeds, input_ids[i], bos_id, eos_id
+                    )
+                current_audio_embed_list = []
+                # since the original audio can be chunked into multiple samples, we collect them
+                # and concat them back to a single sample
+                for idx in bos_idx:
+                    audio_len = min(audio_embeds_lens[audio_num], seqlen)
+                    current_audio_embed = audio_embeds[audio_num, :audio_len, :]
+                    current_input_embeds = torch.cat(
+                        (current_input_embeds[:idx + 1], current_audio_embed, current_input_embeds[idx + 1:]),
+                        dim=0,
+                    )
+                    current_labels = torch.cat(
+                        (
+                            current_labels[:idx + 1],
+                            torch.full((audio_len,), fill_value=-100, dtype=torch.long).to(current_labels.device),
+                            current_labels[idx + 1:],
+                        ),
+                        dim=0,
+                    )
+                    audio_num += 1
+                    bos_idx += audio_len
+                    current_audio_embed_list.append(current_audio_embed)
+                current_audio_embed = torch.cat(current_audio_embed_list, dim=0)
+                first_response_positions = (current_labels != -100).nonzero(as_tuple=True)[0]
+                if len(first_response_positions) > 0:
+                    reasoning_audio_list.append(current_audio_embed)
+                    user_prompt_list.append(current_text_prompt_embed)
+                    reasoning_insert_at.append(first_response_positions[0].item())
+                else:
+                    reasoning_audio_list.append(None)
+                    user_prompt_list.append(None)
+                    reasoning_insert_at.append(None)
+                current_attention_mask = torch.ones((len(current_input_embeds),), dtype=torch.long).to(current_labels.device)
+                input_embeds_list.append(current_input_embeds)
+                attention_mask_list.append(current_attention_mask)
+                labels_list.append(current_labels)
+
+            valid_idx = [i for i, insert_at in enumerate(reasoning_insert_at) if insert_at is not None]
+            if valid_idx:
+                audio_padded = rnn.pad_sequence(
+                    [reasoning_audio_list[i] for i in valid_idx], batch_first=True
+                )  # (B', max_A, hidden)
+                text_padded = rnn.pad_sequence(
+                    [user_prompt_list[i] for i in valid_idx], batch_first=True
+                )  # (B', max_T, hidden)
+                device = audio_padded.device
+                audio_lens = [reasoning_audio_list[i].shape[0] for i in valid_idx]
+                text_lens = [user_prompt_list[i].shape[0] for i in valid_idx]
+                # key_padding_mask: True = padding position to be ignored
+                audio_pad_mask = (
+                    torch.arange(audio_padded.shape[1], device=device).unsqueeze(0)
+                    >= torch.tensor(audio_lens, device=device).unsqueeze(1)
+                )
+                text_pad_mask = (
+                    torch.arange(text_padded.shape[1], device=device).unsqueeze(0)
+                    >= torch.tensor(text_lens, device=device).unsqueeze(1)
+                )
+                reasoning_out = self.reasoning_network(
+                    text_padded,
+                    audio_padded,
+                    text_key_padding_mask=text_pad_mask,
+                    audio_key_padding_mask=audio_pad_mask,
+                )  # (B', N, d_model)
+                reasoning_embeds = self.post_reasoning_proj(reasoning_out)  # (B', N, hidden)
+
+                for k, i in enumerate(valid_idx):
+                    insert_at = reasoning_insert_at[i]
+                    pause_embeds = reasoning_embeds[k].to(input_embeds_list[i].dtype)  # (N, hidden)
+                    input_embeds_list[i] = torch.cat(
+                        [
+                            input_embeds_list[i][:insert_at],
+                            pause_embeds,
+                            input_embeds_list[i][insert_at:],
+                        ],
+                        dim=0,
+                    )
+                    pause_labels = torch.full(
+                        (self.num_pause_steps,), -100, dtype=torch.long, device=labels_list[i].device
+                    )
+                    labels_list[i] = torch.cat(
+                        [
+                            labels_list[i][:insert_at],
+                            pause_labels,
+                            labels_list[i][insert_at:],
+                        ],
+                        dim=0,
+                    )
+                    # Update attention mask to cover the inserted tokens
+                    attention_mask_list[i] = torch.ones(
+                        (len(input_embeds_list[i]),), dtype=torch.long, device=device
+                    )
+            input_embeds = rnn.pad_sequence(input_embeds_list, batch_first=True)
+            attention_mask = rnn.pad_sequence(attention_mask_list, batch_first=True, padding_value=0)
+            labels = rnn.pad_sequence(labels_list, batch_first=True, padding_value=-100)
+            return input_embeds, attention_mask, labels
+
+        reasoning_audio_list = []
+        user_prompt_list = []
+        for i in range(bsz):
+            if is_peft_model(self.base_llm):
+                current_input_embeds = self.base_llm.model.model.embed_tokens(input_ids[i].to(torch.int64))
+            else:
+                current_input_embeds = self.base_llm.model.embed_tokens(input_ids[i].to(torch.int64))
+            # find where currect_input_ids == bos_id, return all the index
+            bos_idx = (input_ids[i] == bos_id).nonzero(as_tuple=True)[0]
+            padding_idx = (input_ids[i] == padding_id).nonzero(as_tuple=True)[0]
+            if self.use_qwen3_embedding_model:
+                current_text_prompt_embed = external_user_prompt_embeds[i]
+            else:
+                current_text_prompt_embed = self._get_llm_user_prompt_embeds(
+                    current_input_embeds, input_ids[i], bos_id, eos_id
+                )
+            current_audio_embed_list = []
+            for idx in bos_idx:
+                audio_len = min(audio_embeds_lens[audio_num], seqlen)
+                current_audio_embed = audio_embeds[audio_num, :audio_len, :]
+                current_input_embeds = torch.cat(
+                    (current_input_embeds[:idx + 1], current_audio_embed, current_input_embeds[idx + 1:]),
+                    dim=0,
+                )
+                audio_num += 1
+                bos_idx += audio_len
+                padding_idx += audio_len
+                current_audio_embed_list.append(current_audio_embed)
+            current_attention_mask = torch.ones((len(current_input_embeds),), dtype=torch.long).to(current_input_embeds.device)
+            current_attention_mask[padding_idx] = 0
+            current_audio_embed = torch.cat(current_audio_embed_list, dim=0)
+            reasoning_audio_list.append(current_audio_embed)
+            user_prompt_list.append(current_text_prompt_embed)
+            input_embeds_list.append(current_input_embeds)
+            attention_mask_list.append(current_attention_mask)
+
+        if reasoning_audio_list:
+            audio_padded = rnn.pad_sequence(reasoning_audio_list, batch_first=True)
+            text_padded = rnn.pad_sequence(user_prompt_list, batch_first=True)
+            device = audio_padded.device
+            audio_lens = [t.shape[0] for t in reasoning_audio_list]
+            text_lens = [t.shape[0] for t in user_prompt_list]
+            audio_pad_mask = (
+                torch.arange(audio_padded.shape[1], device=device).unsqueeze(0)
+                >= torch.tensor(audio_lens, device=device).unsqueeze(1)
+            )
+            text_pad_mask = (
+                torch.arange(text_padded.shape[1], device=device).unsqueeze(0)
+                >= torch.tensor(text_lens, device=device).unsqueeze(1)
+            )
+            reasoning_out = self.reasoning_network(
+                text_padded,
+                audio_padded,
+                text_key_padding_mask=text_pad_mask,
+                audio_key_padding_mask=audio_pad_mask,
+            )  # (B, N, d_model)
+            reasoning_embeds = self.post_reasoning_proj(reasoning_out)  # (B, N, hidden)
+            for i in range(bsz):
+                pause_embeds = reasoning_embeds[i].to(input_embeds_list[i].dtype)
+                input_embeds_list[i] = torch.cat([input_embeds_list[i], pause_embeds], dim=0)
+                pause_mask = torch.ones((self.num_pause_steps,), dtype=torch.long, device=device)
+                attention_mask_list[i] = torch.cat([attention_mask_list[i], pause_mask], dim=0)
+        input_embeds = rnn.pad_sequence(input_embeds_list, batch_first=True, padding_side="left")
+        attention_mask = rnn.pad_sequence(
+            attention_mask_list, batch_first=True, padding_value=0, padding_side="left"
+        )
+        return input_embeds, attention_mask, None
+
+    def prepare_inputs_labels_for_speech(self, input_ids, attention_mask, labels, fbank_feature, fbank_feature_len, raw_wavs, user_prompts=None):
         if self.llm_type == "Qwen":
             bos_id = 151652
             padding_id = 151643
-            eos_id = 151645 # <|im_end|>
         elif self.llm_type == "Llama":
             bos_id = 128002
             padding_id = 128004
@@ -885,18 +1177,31 @@ class SALMONN(PreTrainedModel):
             audio_embeds, audio_embeds_lens = self.inject_temporal_embeddings_with_natural_language(
                 audio_embeds, audio_embeds_lens
             )
-        _, seqlen, dim = audio_embeds.size()
+
+        external_user_prompt_embeds = None
+        if self.use_reasoning_network and self.num_pause_steps > 0 and self.use_qwen3_embedding_model:
+            external_user_prompt_embeds = self._get_external_user_prompt_embeds(
+                user_prompts, input_ids.device
+            )
+        if self.use_reasoning_network and self.num_pause_steps > 0:
+            import pdb; pdb.set_trace()
+            return self.prepare_inputs_labels_for_speech_with_reasoning(
+                input_ids,
+                labels,
+                audio_embeds,
+                audio_embeds_lens,
+                bos_id,
+                padding_id,
+                external_user_prompt_embeds=external_user_prompt_embeds,
+            )
+
+        _, seqlen, _ = audio_embeds.size()
         bsz = input_ids.shape[0]
         input_embeds_list = []
         attention_mask_list = []
         audio_num = 0
         if labels is not None:
             labels_list = []
-            # For batched reasoning network: collect per-sample inputs during the loop,
-            # run the network once after, then insert the results.
-            reasoning_audio_list = []    # (A_i, hidden) per sample
-            reasoning_text_list = []     # (T_i, hidden) per sample
-            reasoning_insert_at = []     # int or None per sample
             for i in range(bsz):
                 if is_peft_model(self.base_llm):
                     current_input_embeds = self.base_llm.model.model.embed_tokens(input_ids[i].to(torch.int64))
@@ -905,185 +1210,96 @@ class SALMONN(PreTrainedModel):
                 current_labels = labels[i]
                 # find where currect_input_ids == bos_id, return all the index, this will be used for injecting audio embedding
                 bos_idx = (input_ids[i] == bos_id).nonzero(as_tuple=True)[0]
-                eos_idx = (input_ids[i] == eos_id).nonzero(as_tuple=True)[0]
-                last_bos_idx = bos_idx[-1].item()
-                # the text prompt embedding should be between <audio> (which is the last bos) and the first <|im_end|>
-                # +2 is to skip the <audio> token as well as the <|vision_end|>
-                current_text_prompt_embed = current_input_embeds[last_bos_idx+2:eos_idx[0]]
-                current_audio_embed_list = []
-                # since the original audio can be chunked into multiple samples, we collect them
-                # and concat them back to a single sample
                 for idx in bos_idx:
                     audio_len = min(audio_embeds_lens[audio_num], seqlen)
-                    current_audio_embed = audio_embeds[audio_num,:audio_len,:]
+                    current_audio_embed = audio_embeds[audio_num, :audio_len, :]
                     current_input_embeds = torch.cat(
-                        (current_input_embeds[:idx+1],current_audio_embed,current_input_embeds[idx+1:]),
-                        dim=0
+                        (current_input_embeds[:idx + 1], current_audio_embed, current_input_embeds[idx + 1:]),
+                        dim=0,
                     )
-                    current_labels = torch.cat((current_labels[:idx+1], torch.full((audio_len,), fill_value=-100, dtype=torch.long).to(current_labels.device),current_labels[idx+1:]),dim=0)
+                    current_labels = torch.cat(
+                        (
+                            current_labels[:idx + 1],
+                            torch.full((audio_len,), fill_value=-100, dtype=torch.long).to(current_labels.device),
+                            current_labels[idx + 1:],
+                        ),
+                        dim=0,
+                    )
                     audio_num += 1
                     bos_idx += audio_len
-                    current_audio_embed_list.append(current_audio_embed)
-                current_audio_embed = torch.cat(current_audio_embed_list, dim=0)
                 if self.num_pause_steps > 0:
                     first_response_positions = (current_labels != -100).nonzero(as_tuple=True)[0]
                     if len(first_response_positions) > 0:
                         insert_at = first_response_positions[0].item()
-                        if self.use_reasoning_network:
-                            # Defer insertion — collect inputs for the batched forward pass below
-                            reasoning_audio_list.append(current_audio_embed)
-                            reasoning_text_list.append(current_text_prompt_embed)
-                            reasoning_insert_at.append(insert_at)
+                        if self.distinct_pause_embed:
+                            pause_embeds = self.pause_embed.to(current_input_embeds.dtype)
                         else:
-                            if self.distinct_pause_embed:
-                                pause_embeds = self.pause_embed.to(current_input_embeds.dtype)
-                            else:
-                                pause_embeds = self.pause_embed.to(current_input_embeds.dtype).expand(self.num_pause_steps, -1)
-                            current_input_embeds = torch.cat([
+                            pause_embeds = self.pause_embed.to(current_input_embeds.dtype).expand(self.num_pause_steps, -1)
+                        current_input_embeds = torch.cat(
+                            [
                                 current_input_embeds[:insert_at],
                                 pause_embeds,
-                                current_input_embeds[insert_at:]
-                            ], dim=0)
-                            pause_labels = torch.full(
-                                (self.num_pause_steps,), -100, dtype=torch.long, device=current_labels.device
-                            )
-                            current_labels = torch.cat([
+                                current_input_embeds[insert_at:],
+                            ],
+                            dim=0,
+                        )
+                        pause_labels = torch.full(
+                            (self.num_pause_steps,), -100, dtype=torch.long, device=current_labels.device
+                        )
+                        current_labels = torch.cat(
+                            [
                                 current_labels[:insert_at],
                                 pause_labels,
-                                current_labels[insert_at:]
-                            ], dim=0)
-                    elif self.use_reasoning_network:
-                        reasoning_audio_list.append(None)
-                        reasoning_text_list.append(None)
-                        reasoning_insert_at.append(None)
+                                current_labels[insert_at:],
+                            ],
+                            dim=0,
+                        )
                 current_attention_mask = torch.ones((len(current_input_embeds),), dtype=torch.long).to(current_labels.device)
                 input_embeds_list.append(current_input_embeds)
                 attention_mask_list.append(current_attention_mask)
                 labels_list.append(current_labels)
 
-            # Batched reasoning network forward pass — runs once for the whole batch
-            if self.use_reasoning_network and self.num_pause_steps > 0:
-                valid_idx = [i for i, ins in enumerate(reasoning_insert_at) if ins is not None]
-                if valid_idx:
-                    audio_padded = rnn.pad_sequence(
-                        [reasoning_audio_list[i] for i in valid_idx], batch_first=True
-                    )  # (B', max_A, hidden)
-                    text_padded = rnn.pad_sequence(
-                        [reasoning_text_list[i] for i in valid_idx], batch_first=True
-                    )  # (B', max_T, hidden)
-                    device = audio_padded.device
-                    audio_lens = [reasoning_audio_list[i].shape[0] for i in valid_idx]
-                    text_lens  = [reasoning_text_list[i].shape[0]  for i in valid_idx]
-                    # key_padding_mask: True = padding position to be ignored
-                    audio_pad_mask = (
-                        torch.arange(audio_padded.shape[1], device=device).unsqueeze(0)
-                        >= torch.tensor(audio_lens, device=device).unsqueeze(1)
-                    )
-                    text_pad_mask = (
-                        torch.arange(text_padded.shape[1], device=device).unsqueeze(0)
-                        >= torch.tensor(text_lens, device=device).unsqueeze(1)
-                    )
-                    reasoning_out = self.reasoning_network(
-                        text_padded, audio_padded,
-                        text_key_padding_mask=text_pad_mask,
-                        audio_key_padding_mask=audio_pad_mask,
-                    )  # (B', N, d_model)
-                    reasoning_embeds = self.post_reasoning_proj(reasoning_out)  # (B', N, hidden)
-
-                    for k, i in enumerate(valid_idx):
-                        insert_at = reasoning_insert_at[i]
-                        pause_embeds = reasoning_embeds[k].to(input_embeds_list[i].dtype)  # (N, hidden)
-                        input_embeds_list[i] = torch.cat([
-                            input_embeds_list[i][:insert_at],
-                            pause_embeds,
-                            input_embeds_list[i][insert_at:]
-                        ], dim=0)
-                        pause_labels = torch.full(
-                            (self.num_pause_steps,), -100, dtype=torch.long, device=labels_list[i].device
-                        )
-                        labels_list[i] = torch.cat([
-                            labels_list[i][:insert_at],
-                            pause_labels,
-                            labels_list[i][insert_at:]
-                        ], dim=0)
-                        # Update attention mask to cover the inserted tokens
-                        attention_mask_list[i] = torch.ones(
-                            (len(input_embeds_list[i]),), dtype=torch.long, device=device
-                        )
             input_embeds = rnn.pad_sequence(input_embeds_list, batch_first=True)
             attention_mask = rnn.pad_sequence(attention_mask_list, batch_first=True, padding_value=0)
             labels = rnn.pad_sequence(labels_list, batch_first=True, padding_value=-100)
             return input_embeds, attention_mask, labels
-        else:
-            reasoning_audio_list = []
-            reasoning_text_list = []
-            for i in range(bsz):
-                if is_peft_model(self.base_llm):
-                    current_input_embeds = self.base_llm.model.model.embed_tokens(input_ids[i].to(torch.int64))
-                else:
-                    current_input_embeds = self.base_llm.model.embed_tokens(input_ids[i].to(torch.int64))
-                # find where currect_input_ids == bos_id, return all the index
-                bos_idx = (input_ids[i] == bos_id).nonzero(as_tuple=True)[0]
-                padding_idx = (input_ids[i] == padding_id).nonzero(as_tuple=True)[0]
-                last_bos_idx = bos_idx[-1].item()
-                if self.use_reasoning_network and self.num_pause_steps > 0:
-                    eos_idx = (input_ids[i] == eos_id).nonzero(as_tuple=True)[0]
-                    current_text_prompt_embed = current_input_embeds[last_bos_idx+2:eos_idx[0]]
-                current_audio_embed_list = []
-                for idx in bos_idx:
-                    audio_len = min(audio_embeds_lens[audio_num], seqlen)
-                    current_audio_embed = audio_embeds[audio_num,:audio_len,:]
-                    current_input_embeds = torch.cat((current_input_embeds[:idx+1],current_audio_embed,current_input_embeds[idx+1:]),dim=0)
-                    audio_num += 1
-                    bos_idx += audio_len
-                    padding_idx += audio_len
-                    if self.use_reasoning_network and self.num_pause_steps > 0:
-                        current_audio_embed_list.append(current_audio_embed)
-                current_attention_mask = torch.ones((len(current_input_embeds),), dtype=torch.long).to(current_input_embeds.device)
-                current_attention_mask[padding_idx] = 0
-                if self.num_pause_steps > 0:
-                    if self.use_reasoning_network:
-                        current_audio_embed = torch.cat(current_audio_embed_list, dim=0)
-                        reasoning_audio_list.append(current_audio_embed)
-                        reasoning_text_list.append(current_text_prompt_embed)
-                    else:
-                        if self.distinct_pause_embed:
-                            pause_embeds = self.pause_embed.to(current_input_embeds.dtype)
-                        else:
-                            pause_embeds = self.pause_embed.to(current_input_embeds.dtype).expand(self.num_pause_steps, -1)
-                        current_input_embeds = torch.cat([current_input_embeds, pause_embeds], dim=0)
-                        pause_mask = torch.ones((self.num_pause_steps,), dtype=torch.long).to(current_input_embeds.device)
-                        current_attention_mask = torch.cat([current_attention_mask, pause_mask], dim=0)
-                input_embeds_list.append(current_input_embeds)
-                attention_mask_list.append(current_attention_mask)
 
-            # Batched reasoning network forward pass
-            if self.use_reasoning_network and self.num_pause_steps > 0 and reasoning_audio_list:
-                audio_padded = rnn.pad_sequence(reasoning_audio_list, batch_first=True)
-                text_padded  = rnn.pad_sequence(reasoning_text_list,  batch_first=True)
-                device = audio_padded.device
-                audio_lens = [t.shape[0] for t in reasoning_audio_list]
-                text_lens  = [t.shape[0] for t in reasoning_text_list]
-                audio_pad_mask = (
-                    torch.arange(audio_padded.shape[1], device=device).unsqueeze(0)
-                    >= torch.tensor(audio_lens, device=device).unsqueeze(1)
+        for i in range(bsz):
+            if is_peft_model(self.base_llm):
+                current_input_embeds = self.base_llm.model.model.embed_tokens(input_ids[i].to(torch.int64))
+            else:
+                current_input_embeds = self.base_llm.model.embed_tokens(input_ids[i].to(torch.int64))
+            # find where currect_input_ids == bos_id, return all the index
+            bos_idx = (input_ids[i] == bos_id).nonzero(as_tuple=True)[0]
+            padding_idx = (input_ids[i] == padding_id).nonzero(as_tuple=True)[0]
+            for idx in bos_idx:
+                audio_len = min(audio_embeds_lens[audio_num], seqlen)
+                current_audio_embed = audio_embeds[audio_num, :audio_len, :]
+                current_input_embeds = torch.cat(
+                    (current_input_embeds[:idx + 1], current_audio_embed, current_input_embeds[idx + 1:]),
+                    dim=0,
                 )
-                text_pad_mask = (
-                    torch.arange(text_padded.shape[1], device=device).unsqueeze(0)
-                    >= torch.tensor(text_lens, device=device).unsqueeze(1)
-                )
-                reasoning_out = self.reasoning_network(text_padded, audio_padded,
-                                       text_key_padding_mask=text_pad_mask,
-                                       audio_key_padding_mask=audio_pad_mask)  # (B, N, d_model)
-                reasoning_embeds = self.post_reasoning_proj(reasoning_out)      # (B, N, hidden)
-                for i in range(bsz):
-                    pause_embeds = reasoning_embeds[i].to(input_embeds_list[i].dtype)
-                    input_embeds_list[i] = torch.cat([input_embeds_list[i], pause_embeds], dim=0)
-                    pause_mask = torch.ones((self.num_pause_steps,), dtype=torch.long, device=device)
-                    attention_mask_list[i] = torch.cat([attention_mask_list[i], pause_mask], dim=0)
-            input_embeds = rnn.pad_sequence(input_embeds_list, batch_first=True, padding_side="left")
-            attention_mask = rnn.pad_sequence(attention_mask_list, batch_first=True, padding_value=0, padding_side="left")
-            return input_embeds, attention_mask, None
+                audio_num += 1
+                bos_idx += audio_len
+                padding_idx += audio_len
+            current_attention_mask = torch.ones((len(current_input_embeds),), dtype=torch.long).to(current_input_embeds.device)
+            current_attention_mask[padding_idx] = 0
+            if self.num_pause_steps > 0:
+                if self.distinct_pause_embed:
+                    pause_embeds = self.pause_embed.to(current_input_embeds.dtype)
+                else:
+                    pause_embeds = self.pause_embed.to(current_input_embeds.dtype).expand(self.num_pause_steps, -1)
+                current_input_embeds = torch.cat([current_input_embeds, pause_embeds], dim=0)
+                pause_mask = torch.ones((self.num_pause_steps,), dtype=torch.long).to(current_input_embeds.device)
+                current_attention_mask = torch.cat([current_attention_mask, pause_mask], dim=0)
+            input_embeds_list.append(current_input_embeds)
+            attention_mask_list.append(current_attention_mask)
+
+        input_embeds = rnn.pad_sequence(input_embeds_list, batch_first=True, padding_side="left")
+        attention_mask = rnn.pad_sequence(
+            attention_mask_list, batch_first=True, padding_value=0, padding_side="left"
+        )
+        return input_embeds, attention_mask, None
     
     def maybe_autocast(self, dtype=torch.bfloat16):
         # if on cpu, don't use autocast
@@ -1109,7 +1325,9 @@ class SALMONN(PreTrainedModel):
         return_dict = None,
         fbank_feature = None,
         fbank_feature_len = None,
-        raw_wavs = None
+        raw_wavs = None,
+        audio_files = None,
+        user_prompts = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -1118,9 +1336,13 @@ class SALMONN(PreTrainedModel):
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         # print(f"Current rank: {int(os.environ.get('RANK', 0))}, fbank_feature_len: {fbank_feature_len}")
-        input_embeds, attention_mask, labels = self.prepare_inputs_labels_for_speech(
-            input_ids, attention_mask, labels, fbank_feature, fbank_feature_len, raw_wavs
-        )
+        try:
+            input_embeds, attention_mask, labels = self.prepare_inputs_labels_for_speech(
+                input_ids, attention_mask, labels, fbank_feature, fbank_feature_len, raw_wavs, user_prompts,
+            )
+        except:
+            print(f"Error in prepare_inputs_labels_for_speech, the audio files are: {audio_files}")
+            raise
 
         # Decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
         with self.maybe_autocast():
@@ -1144,6 +1366,7 @@ class SALMONN(PreTrainedModel):
         fbank_feature,
         fbank_feature_len,
         raw_wavs=None,
+        user_prompts=None,
         max_new_tokens=0,
         logits_processor=[],
         generation_config=None,
@@ -1165,7 +1388,7 @@ class SALMONN(PreTrainedModel):
             eos_token_id = [eos_token_id]
 
         inputs_embeds, attention_mask, _ = self.prepare_inputs_labels_for_speech(
-            input_ids, None, None, fbank_feature, fbank_feature_len, raw_wavs
+            input_ids, None, None, fbank_feature, fbank_feature_len, raw_wavs, user_prompts
         )
 
         stopping_criteria = StoppingCriteriaList([StoppingCriteriaSub(stops=[torch.tensor([generation_config.eos_token_id]).cuda()])])
