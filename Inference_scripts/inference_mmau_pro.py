@@ -15,11 +15,15 @@ import torchaudio
 import torch.nn.functional as F
 from transformers import AutoFeatureExtractor
 import soundfile as sf
+from inference_utils import OVERRIDE_KEYS, override_args_from_config
 
 
 LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-MC_EXCLUDED = {"open", "instruction following", "multi"}
-# MC_EXCLUDED = {"instruction following", "multi"}
+# MC_EXCLUDED = {"open", "instruction following", "multi"}
+MC_EXCLUDED = set()  # all categories are now handled
+# MC_EXCLUDED = {"open", "multi"}
+
+ORDINALS = ["first", "second", "third", "fourth", "fifth"]
 
 QUESTION_TEMPLATE = (
     "Answer the following multiple-choice question using only the correct option.\n"
@@ -30,23 +34,9 @@ QUESTION_TEMPLATE = (
     "For example, if you think the answer is Option A, please just output 'A'"
 )
 
-ZIPFORMER_LIKE = {"zipformer2", "spear_transformer"}
+OPEN_TEMPLATE = "Question: {question}\nPlease answer the question based on the audio."
 
-OVERRIDE_KEYS = [
-    "weighted_sum_encoder",
-    "concat_encoder_features",
-    "zipformer_version",
-    "connector_hid_size",
-    "connector_seg_size",
-    "connector_type",
-    "expand_vocab",
-    "inject_temporal_embedding",
-    "num_pause_steps",
-    "distinct_pause_embed",
-    "use_reasoning_network",
-    "reasoning_network_dim",
-    "dora",
-]
+ZIPFORMER_LIKE = {"zipformer2", "spear_transformer"}
 
 
 class ModelArguments:
@@ -105,22 +95,6 @@ def parse_args():
     parser.add_argument("--max_samples", type=int, default=None,
                         help="Limit number of samples (for debugging)")
     return parser.parse_args()
-
-
-def override_args_from_config(checkpoint_path: str, model_args):
-    config_file = os.path.join(os.path.dirname(checkpoint_path), "config.json")
-    if not os.path.exists(config_file):
-        logging.warning(f"Config file {config_file} not found. Using default model args.")
-        return model_args
-    with open(config_file) as f:
-        config = json.load(f)
-    saved = config.get("model_args", {})
-    for k in OVERRIDE_KEYS:
-        val = saved.get(k)
-        if val is not None:
-            setattr(model_args, k, val)
-            print(f"Setting {k} to {val} from checkpoint config.")
-    return model_args
 
 
 def build_prompt(question: str, choices: list) -> str:
@@ -361,26 +335,66 @@ def main():
 
     correct_answers = 0
     wrong_format_answers = 0
+    mc_steps = 0
     cat_correct = {}
     cat_total = {}
 
     for step, (i, row) in enumerate(new_rows, 1):
-        choices = list(row["choices"])
         question = row["question"]
         category = row["category"]
-        answer_text = str(row["answer"])
+        is_open = category == "open"
+        is_multi = category == "multi"
+        is_instruction_following = category == "instruction following"
 
-        correct_letter = get_correct_letter(answer_text, choices)
+        raw_audio_paths = [os.path.join(args.audio_root, p.lstrip("./")) for p in row["audio_path"]]
 
-        audio_path = os.path.join(args.audio_root, row["audio_path"][0].lstrip("./"))
-        prompt = build_prompt(question, choices)
+        if is_multi:
+            # Concatenate all clips into a single waveform
+            n = len(raw_audio_paths)
+            waves = []
+            for p in raw_audio_paths:
+                wav, fs = torchaudio.load(p)
+                if fs != 16000:
+                    wav = torchaudio.functional.resample(wav, fs, 16000)
+                if wav.size(0) > 1:
+                    wav = wav.mean(dim=0, keepdim=True)
+                waves.append(wav)
+            combined = torch.cat(waves, dim=1)
+            import tempfile
+            tmp = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            torchaudio.save(tmp.name, combined, 16000)
+            audio_path = tmp.name
+
+            clips = " and ".join(ORDINALS[:n])
+            parts = ", ".join(f"the {ORDINALS[j]} part" for j in range(n))
+            multi_prefix = (
+                f"Listen to the {clips} audio clips and answer the question. "
+                f"The audio has been concatenated in order: {parts} correspond "
+                f"to the {clips} clips respectively. "
+            )
+            choices = list(row["choices"])
+            answer_text = str(row["answer"])
+            correct_letter = get_correct_letter(answer_text, choices)
+            prompt = multi_prefix + build_prompt(question, choices)
+        elif is_open:
+            audio_path = raw_audio_paths[0]
+            prompt = OPEN_TEMPLATE.format(question=question)
+        elif is_instruction_following:
+            audio_path = raw_audio_paths[0]
+            prompt = "Follow the instruction at the start of an audio."
+        else:
+            audio_path = raw_audio_paths[0]
+            choices = list(row["choices"])
+            answer_text = str(row["answer"])
+            correct_letter = get_correct_letter(answer_text, choices)
+            prompt = build_prompt(question, choices)
 
         messages = [{"role": "user", "content": "<audio>" + prompt}]
         text = tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=True,
-            enable_thinking=True, # True necessary for reasoning models
+            enable_thinking=True,  # True necessary for reasoning models
         )
 
         feature, raw_wavs, audio_nums, split_feature_lens = extract_features(
@@ -410,28 +424,37 @@ def main():
                 fbank_feature=feature_t,
                 fbank_feature_len=feature_lens_t,
                 raw_wavs=raw_wavs_t,
+                user_prompts=[prompt],
                 max_new_tokens=500,
             )
 
         model_output_raw = parse_model_output(generated_ids, tokenizer)
 
-        predicted_letter, is_wrong_format = extract_predicted_letter(model_output_raw, choices)
-        model_outputs[i] = choices[ord(predicted_letter) - ord("A")]
+        if is_multi:
+            os.unlink(audio_path)  # remove temp file
 
-        if is_wrong_format:
-            wrong_format_answers += 1
-            warnings.warn(
-                f"Invalid output format for {audio_path}. Got: {repr(model_output_raw)}",
-                stacklevel=1,
-            )
+        if is_open or is_instruction_following:
+            model_outputs[i] = model_output_raw
+        else:
+            predicted_letter, is_wrong_format = extract_predicted_letter(model_output_raw, choices)
+            model_outputs[i] = choices[ord(predicted_letter) - ord("A")]
 
-        cat_total[category] = cat_total.get(category, 0) + 1
-        if correct_letter is not None and predicted_letter == correct_letter:
-            correct_answers += 1
-            cat_correct[category] = cat_correct.get(category, 0) + 1
+            if is_wrong_format:
+                wrong_format_answers += 1
+                warnings.warn(
+                    f"Invalid output format for {row['audio_path']}. Got: {repr(model_output_raw)}",
+                    stacklevel=1,
+                )
+
+            cat_total[category] = cat_total.get(category, 0) + 1
+            mc_steps += 1
+            if correct_letter is not None and predicted_letter == correct_letter:
+                correct_answers += 1
+                cat_correct[category] = cat_correct.get(category, 0) + 1
 
         if step % 100 == 0 or step == total_new:
-            print(f"[{step}/{total_new}] acc so far: {correct_answers}/{step} ({correct_answers/step:.2%})")
+            acc_str = f"{correct_answers}/{mc_steps} ({correct_answers/mc_steps:.2%})" if mc_steps > 0 else "N/A (no MC items yet)"
+            print(f"[{step}/{total_new}] MC acc so far: {acc_str}")
 
     mc_df = mc_df.copy()
     mc_df["model_output"] = model_outputs
@@ -439,16 +462,16 @@ def main():
     os.makedirs(os.path.dirname(os.path.abspath(args.output_path)), exist_ok=True)
     mc_df.to_parquet(args.output_path, index=False)
 
-    accuracy = correct_answers / total_new if total_new > 0 else 0.0
+    accuracy = correct_answers / mc_steps if mc_steps > 0 else 0.0
     checkpoint_name = os.path.basename(os.path.normpath(model_args.model_name_or_path))
 
     print("\n===== Inference Summary =====")
     print(f"Checkpoint : {model_args.model_name_or_path} ({checkpoint_name})")
     print(f"Encoder    : {model_args.encoder_type}")
     print(f"Total      : {total} ({total_new} newly evaluated, {len(mc_df) - total_new} cached)")
-    print(f"Correct    : {correct_answers}/{total_new} ({accuracy:.2%}) [new items only]")
+    print(f"Correct    : {correct_answers}/{mc_steps} ({accuracy:.2%}) [MC only, newly evaluated]")
     print(f"Wrong fmt  : {wrong_format_answers}")
-    print(f"\nPer-category accuracy:")
+    print(f"\nPer-category accuracy (MC only):")
     for cat in sorted(cat_total):
         n = cat_total[cat]
         c = cat_correct.get(cat, 0)

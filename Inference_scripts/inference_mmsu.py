@@ -1,10 +1,12 @@
 import json
-import logging
 import math
 import re
 import warnings
 import argparse
 import os
+
+from tqdm import tqdm
+from datasets import load_dataset
 
 from modeling_salmonn import SALMONN
 from lhotse import Fbank, FbankConfig
@@ -13,11 +15,16 @@ import torch
 import torchaudio
 import torch.nn.functional as F
 from transformers import AutoFeatureExtractor
-import soundfile as sf
 from inference_utils import OVERRIDE_KEYS, override_args_from_config
 
 
-LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+DATASET_ROOT = "/mnt/shared-storage-user/brainllm-share/data/MMSU"
+ZIPFORMER_LIKE = {"zipformer2", "spear_transformer"}
+
+QUESTION_PROMPTS = (
+    "Choose the most suitable answer from options A, B, C, and D. "
+    "You must respond with only A, B, C, or D."
+)
 
 QUESTION_TEMPLATE = (
     "Answer the following multiple-choice question using only the correct option.\n"
@@ -27,9 +34,6 @@ QUESTION_TEMPLATE = (
     "Please output your final answer with a single letter. "
     "For example, if you think the answer is Option A, please just output 'A'"
 )
-
-# Encoders that share the same Fbank config and chunking logic
-ZIPFORMER_LIKE = {"zipformer2", "spear_transformer"}
 
 
 class ModelArguments:
@@ -45,10 +49,6 @@ class ModelArguments:
     encoder_type: str = "zipformer2"
     audio_encoder_path: str = ""
     freeze_encoder: bool = True
-    encoder_lora: bool = False
-    encoder_lora_rank: int = 8
-    encoder_lora_alpha: int = 8
-    encoder_lora_dropout: float = 0.05
     connector_type: str = "MLP"
     connector_seg_size: int = 5
     connector_hid_size: int = 4096
@@ -81,27 +81,32 @@ def str2bool(v):
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Evaluate SALMONN on MMAU test/test-mini")
+    parser = argparse.ArgumentParser(description="Evaluate SALMONN on MMSU")
     parser.add_argument("--model_name_or_path", type=str, required=True,
                         help="Path to model checkpoint")
     parser.add_argument("--encoder_type", type=str, default=None,
-                        help="Audio encoder type (e.g. zipformer2, spear_transformer). "
-                             "If not set, value from checkpoint config.json is used.")
-    parser.add_argument("--mmau_json", type=str, required=True,
-                        help="Path to mmau-test.json or mmau-test-mini.json")
-    parser.add_argument("--audio_root", type=str, required=True,
-                        help="Root directory containing MMAU audio files")
-    parser.add_argument("--output_path", type=str, required=True,
-                        help="Path to write the annotated output JSON")
+                        help="Audio encoder type. If not set, value from checkpoint config.json is used.")
+    parser.add_argument("--split", type=str, default="train",
+                        help="Dataset split (default: train)")
+    parser.add_argument("--output_jsonl", type=str, required=True,
+                        help="Path to save output JSONL file")
     parser.add_argument("--concat_encoder_features", type=str2bool, default=None)
+    parser.add_argument("--use_qa_prompt", type=str2bool, default=False,
+                        help="Use the QA-style prompt template instead of the default MMSU prompt")
     return parser.parse_args()
 
 
-def build_prompt(question: str, choices: list) -> str:
-    choices_lines = "\n".join(
-        f"Option {LETTERS[i]}: {choice}" for i, choice in enumerate(choices)
-    )
-    return QUESTION_TEMPLATE.format(question=question, choices_str=choices_lines)
+def build_prompt(question, choice_a, choice_b, choice_c, choice_d, use_qa_prompt=False):
+    if use_qa_prompt:
+        choices_str = (
+            f"Option A: {choice_a}\n"
+            f"Option B: {choice_b}\n"
+            f"Option C: {choice_c}\n"
+            f"Option D: {choice_d}"
+        )
+        return QUESTION_TEMPLATE.format(question=question, choices_str=choices_str)
+    choices = f"A. {choice_a}\nB. {choice_b}\nC. {choice_c}\nD. {choice_d}"
+    return f"{QUESTION_PROMPTS}\n\nQuestion: {question}\n\n{choices}"
 
 
 def get_fbank(model_args):
@@ -133,24 +138,20 @@ def get_fbank(model_args):
         raise ValueError(f"Unknown encoder_type: {enc}")
 
 
-def extract_features(audio_path, fbank, model_args):
-    """Extract fbank features for a single audio file.
-
-    Returns:
-        feature: list of feature tensors
-        raw_wavs: list of raw waveform tensors (only for whisper_beats / qwenomni)
-        audio_nums: list of chunk counts per audio (only for split zipformer-like)
-        split_feature_lens: list of frame lengths for split chunks
-    """
+def extract_features_from_array(audio_array, sampling_rate, fbank, model_args):
+    """Extract fbank features from a raw audio numpy array."""
     audio_chunk = model_args.audio_chunk * 16000
     enc = model_args.encoder_type
 
     feature, raw_wavs, audio_nums, split_feature_lens = [], [], [], []
 
-    audio, fs = torchaudio.load(audio_path)
-    if fs != 16000:
-        audio = torchaudio.functional.resample(audio, fs, 16000)
-        fs = 16000
+    audio = torch.from_numpy(audio_array).float()
+    if audio.ndim == 1:
+        audio = audio.unsqueeze(0)  # [1, T]
+
+    if sampling_rate != 16000:
+        audio = torchaudio.functional.resample(audio, sampling_rate, 16000)
+    fs = 16000
 
     if enc in ZIPFORMER_LIKE:
         if model_args.split_audio and audio.shape[-1] > audio_chunk:
@@ -185,14 +186,10 @@ def extract_features(audio_path, fbank, model_args):
         if audio.size(0) > 1:
             audio = audio.mean(dim=0, keepdim=True)
         raw_wavs.append(audio.squeeze())
-        sf_audio, _ = sf.read(audio_path, frames=30 * 16000)
-        if sf_audio.ndim == 2:
-            sf_audio = sf_audio[:, 0]
+        sf_audio = audio.squeeze().numpy()
         feature.append(fbank(sf_audio, sampling_rate=fs, return_tensors="pt")["input_features"].squeeze())
     elif enc in ("qwenomni", "qwen3omni"):
-        sf_audio, _ = sf.read(audio_path, frames=300 * 16000)
-        if sf_audio.ndim == 2:
-            sf_audio = sf_audio[:, 0]
+        sf_audio = audio.squeeze().numpy()
         one_fbank = fbank(sf_audio, sampling_rate=fs, return_tensors="pt", return_attention_mask=True)
         feature.append(one_fbank["input_features"].squeeze())
         raw_wavs.append(one_fbank["attention_mask"].squeeze())
@@ -237,7 +234,7 @@ def parse_model_output(generated_ids, tokenizer):
     return content.strip().strip(".")
 
 
-def extract_predicted_letter(model_output_raw, choices):
+def extract_predicted_letter(model_output_raw, num_choices=4):
     """Parse a letter from model output. Returns (letter, is_wrong_format)."""
     single_letter_pattern = re.compile(r"^[A-Za-z]$")
     option_letter_pattern = re.compile(r"^Option\s+([A-Za-z])$", re.IGNORECASE)
@@ -248,17 +245,11 @@ def extract_predicted_letter(model_output_raw, choices):
     if m:
         return m.group(1).upper(), False
 
-    # Wrong format — check if output contains the text of a choice
-    output_lower = model_output_raw.lower()
-    matched_indices = [i for i, c in enumerate(choices) if c.strip().lower() in output_lower]
-    if len(matched_indices) == 1:
-        return LETTERS[matched_indices[0]], True
-
-    # Fall back to first letter found, default to 'A' if out of range
+    # Fall back to first valid letter found
     first = re.search(r"[A-Za-z]", model_output_raw)
     if first:
         candidate = first.group(0).upper()
-        letter = candidate if ord(candidate) - ord("A") < len(choices) else "A"
+        letter = candidate if ord(candidate) - ord("A") < num_choices else "A"
     else:
         letter = "A"
     return letter, True
@@ -271,7 +262,6 @@ def main():
     model_args.model_name_or_path = args.model_name_or_path
     model_args = override_args_from_config(args.model_name_or_path, model_args)
 
-    # Explicit CLI arguments override config values
     if args.encoder_type is not None:
         model_args.encoder_type = args.encoder_type
     if args.concat_encoder_features is not None:
@@ -279,7 +269,6 @@ def main():
 
     print(f"Encoder type: {model_args.encoder_type}")
 
-    # Load tokenizer and model
     if model_args.llm_type == "Qwen":
         tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path)
     elif model_args.llm_type == "Llama":
@@ -297,105 +286,124 @@ def main():
     model.eval()
 
     fbank = get_fbank(model_args)
-
-    # Load MMAU data
-    with open(args.mmau_json) as f:
-        data = json.load(f)
-
-    total_questions = len(data)
-    correct_answers = 0
-    wrong_format_answers = 0
     enc = model_args.encoder_type
 
-    for i, item in enumerate(data):
-        choices = item["choices"]
-        prompt = build_prompt(item["question"], choices)
+    dataset = load_dataset(DATASET_ROOT, split=args.split)
 
-        rel = item["audio_id"].lstrip("./")
-        audio_path = os.path.join(args.audio_root, rel)
+    total_questions = len(dataset)
+    correct_answers = 0
+    wrong_format_answers = 0
 
-        messages = [{"role": "user", "content": "<audio>" + prompt}]
-        # For regular model, enable_thinking is False in default decoding False
-        # For thinking model, enable_thinking is True
-        text = tokenizer.apply_chat_template(
-            messages, 
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=True, # TODO: in the training code, the pause embed is injected before <think>
-        )
+    os.makedirs(os.path.dirname(os.path.abspath(args.output_jsonl)), exist_ok=True)
 
-        feature, raw_wavs, audio_nums, split_feature_lens = extract_features(audio_path, fbank, model_args)
+    with open(args.output_jsonl, "w") as fout:
+        for i, item in enumerate(tqdm(dataset)):
+            audio = item["audio"]
+            audio_array = audio["array"]
+            sampling_rate = audio["sampling_rate"]
+            audio_path = audio["path"]
 
-        if enc == "whisper_beats":
-            feature_lens = [f.size(0) for f in raw_wavs]
-        elif enc in ZIPFORMER_LIKE and model_args.split_audio and audio_nums:
-            feature_lens = split_feature_lens
-        else:
-            feature_lens = [f.size(0) for f in feature]
+            question = item["question"]
+            choice_a = item["choice_a"]
+            choice_b = item["choice_b"]
+            choice_c = item.get("choice_c", "")
+            choice_d = item.get("choice_d", "")
 
-        feature_t = torch.nn.utils.rnn.pad_sequence(feature, batch_first=True).to(model.device)
-        raw_wavs_t = (
-            torch.nn.utils.rnn.pad_sequence(raw_wavs, batch_first=True).to(model.device)
-            if raw_wavs else []
-        )
-        feature_lens_t = torch.tensor(feature_lens, device=model.device)
+            prompt = build_prompt(question, choice_a, choice_b, choice_c, choice_d, use_qa_prompt=args.use_qa_prompt)
 
-        model_inputs = prepare_model_inputs(text, audio_nums, tokenizer, model, model_args)
-
-        with torch.no_grad():
-            generated_ids = model.generate(
-                **model_inputs,
-                fbank_feature=feature_t,
-                fbank_feature_len=feature_lens_t,
-                raw_wavs=raw_wavs_t,
-                user_prompts=[prompt],
-                max_new_tokens=500,
+            messages = [{"role": "user", "content": "<audio>" + prompt}]
+            text = tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=True,
             )
 
-        model_output_raw = parse_model_output(generated_ids, tokenizer)
-        predicted_letter, is_wrong_format = extract_predicted_letter(model_output_raw, choices)
-
-        if is_wrong_format:
-            wrong_format_answers += 1
-            warnings.warn(
-                f"Invalid output format for {audio_path}. Got: {repr(model_output_raw)}",
-                stacklevel=1,
+            feature, raw_wavs, audio_nums, split_feature_lens = extract_features_from_array(
+                audio_array, sampling_rate, fbank, model_args
             )
 
-        idx = ord(predicted_letter) - ord("A")
-        item["model_prediction"] = choices[idx] if 0 <= idx < len(choices) else choices[0]
-
-        ground_truth = item.get("answer", "")
-        if ground_truth and item["model_prediction"].strip().lower() == ground_truth.strip().lower():
-            correct_answers += 1
-
-        if i % 100 == 0 and i:
-            evaluated = sum(1 for d in data[:i] if d.get("answer", ""))
-            if evaluated > 0:
-                print(
-                    f"[{i}/{total_questions}] accuracy: {correct_answers}/{evaluated} "
-                    f"({correct_answers/evaluated:.2%}), wrong format: {wrong_format_answers}"
-                )
+            if enc == "whisper_beats":
+                feature_lens = [f.size(0) for f in raw_wavs]
+            elif enc in ZIPFORMER_LIKE and model_args.split_audio and audio_nums:
+                feature_lens = split_feature_lens
             else:
-                print(f"[{i}/{total_questions}] no ground truth yet, wrong format: {wrong_format_answers}")
+                feature_lens = [f.size(0) for f in feature]
 
-    # Write annotated output
-    os.makedirs(os.path.dirname(os.path.abspath(args.output_path)), exist_ok=True)
-    with open(args.output_path, "w") as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+            feature_t = torch.nn.utils.rnn.pad_sequence(feature, batch_first=True).to(model.device)
+            raw_wavs_t = (
+                torch.nn.utils.rnn.pad_sequence(raw_wavs, batch_first=True).to(model.device)
+                if raw_wavs else []
+            )
+            feature_lens_t = torch.tensor(feature_lens, device=model.device)
 
-    evaluated_total = sum(1 for d in data if d.get("answer", ""))
-    accuracy = correct_answers / evaluated_total if evaluated_total > 0 else 0.0
+            model_inputs = prepare_model_inputs(text, audio_nums, tokenizer, model, model_args)
+
+            with torch.no_grad():
+                generated_ids = model.generate(
+                    **model_inputs,
+                    fbank_feature=feature_t,
+                    fbank_feature_len=feature_lens_t,
+                    raw_wavs=raw_wavs_t,
+                    user_prompts=[prompt],
+                    max_new_tokens=500,
+                )
+
+            model_output_raw = parse_model_output(generated_ids, tokenizer)
+            num_choices = sum(1 for c in [choice_a, choice_b, choice_c, choice_d] if c)
+            predicted_letter, is_wrong_format = extract_predicted_letter(model_output_raw, num_choices)
+
+            if is_wrong_format:
+                wrong_format_answers += 1
+                warnings.warn(
+                    f"Invalid output format for {audio_path}. Got: {repr(model_output_raw)}",
+                    stacklevel=1,
+                )
+
+            answer_gt = item["answer_gt"]
+            # choices_list = [choice_a, choice_b, choice_c, choice_d]
+            # gt_letter = next(
+            #     (chr(ord("A") + i) for i, c in enumerate(choices_list) if c.strip() == answer_gt.strip()),
+            #     None,
+            # )
+            # if gt_letter is not None and predicted_letter == gt_letter:
+            #     correct_answers += 1
+
+            result = {
+                "id": item["id"],
+                "audio_path": audio_path,
+                "question": question,
+                "choice_a": choice_a,
+                "choice_b": choice_b,
+                "choice_c": choice_c,
+                "choice_d": choice_d,
+                "answer_gt": answer_gt,
+                "response": predicted_letter,
+                "task_name": item["task_name"],
+                "category": item["category"],
+                "sub-category": item["sub-category"],
+                "sub-sub-category": item["sub-sub-category"],
+                "linguistics_sub_discipline": item["linguistics_sub_discipline"],
+            }
+            fout.write(json.dumps(result, ensure_ascii=False) + "\n")
+
+            # if i % 100 == 0 and i:
+            #     print(
+            #         f"[{i}/{total_questions}] accuracy: {correct_answers}/{i} "
+            #         f"({correct_answers/i:.2%}), wrong format: {wrong_format_answers}"
+            #     )
+
+    accuracy = correct_answers / total_questions if total_questions > 0 else 0.0
     checkpoint_name = os.path.basename(os.path.normpath(model_args.model_name_or_path))
 
     print("\n===== Inference Summary =====")
     print(f"Checkpoint : {model_args.model_name_or_path} ({checkpoint_name})")
     print(f"Encoder    : {model_args.encoder_type}")
+    print(f"Split      : {args.split}")
     print(f"Total      : {total_questions}")
-    print(f"Evaluated  : {evaluated_total} (with ground truth)")
     print(f"Correct    : {correct_answers} ({accuracy:.2%})")
     print(f"Wrong fmt  : {wrong_format_answers}")
-    print(f"Output     : {args.output_path}")
+    print(f"Output     : {args.output_jsonl}")
 
 
 if __name__ == "__main__":

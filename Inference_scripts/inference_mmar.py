@@ -14,6 +14,7 @@ import torchaudio
 import torch.nn.functional as F
 from transformers import AutoFeatureExtractor
 import soundfile as sf
+from inference_utils import OVERRIDE_KEYS, override_args_from_config
 
 
 LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -27,22 +28,12 @@ QUESTION_TEMPLATE = (
     "For example, if you think the answer is Option A, please just output 'A'"
 )
 
-ZIPFORMER_LIKE = {"zipformer2", "spear_transformer"}
+AF_QUESTION_TEMPLATE = (
+    "{question} Choose one among the following options: \n"
+    "{choices_str}"
+)
 
-OVERRIDE_KEYS = [
-    "weighted_sum_encoder",
-    "concat_encoder_features",
-    "zipformer_version",
-    "connector_hid_size",
-    "connector_seg_size",
-    "connector_type",
-    "expand_vocab",
-    "inject_temporal_embedding",
-    "num_pause_steps",
-    "distinct_pause_embed",
-    "use_reasoning_network",
-    "reasoning_network_dim",
-]
+ZIPFORMER_LIKE = {"zipformer2", "spear_transformer"}
 
 
 class ModelArguments:
@@ -97,26 +88,17 @@ def parse_args():
     parser.add_argument("--output_path", type=str, required=True,
                         help="Path to write the annotated output JSON")
     parser.add_argument("--concat_encoder_features", type=str2bool, default=None)
+    parser.add_argument("--use_af_prompt", type=str2bool, default=False,
+                        help="Use 'Choose one among the following options' prompt format")
     return parser.parse_args()
 
 
-def override_args_from_config(checkpoint_path: str, model_args):
-    config_file = os.path.join(os.path.dirname(checkpoint_path), "config.json")
-    if not os.path.exists(config_file):
-        logging.warning(f"Config file {config_file} not found. Using default model args.")
-        return model_args
-    with open(config_file) as f:
-        config = json.load(f)
-    saved = config.get("model_args", {})
-    for k in OVERRIDE_KEYS:
-        val = saved.get(k)
-        if val is not None:
-            setattr(model_args, k, val)
-            print(f"Setting {k} to {val} from checkpoint config.")
-    return model_args
-
-
-def build_prompt(question: str, choices: list) -> str:
+def build_prompt(question: str, choices: list, use_af_prompt: bool = False) -> str:
+    if use_af_prompt:
+        choices_lines = "\n".join(
+            f"({LETTERS[i]}) {choice}" for i, choice in enumerate(choices)
+        )
+        return AF_QUESTION_TEMPLATE.format(question=question, choices_str=choices_lines)
     choices_lines = "\n".join(
         f"Option {LETTERS[i]}: {choice}" for i, choice in enumerate(choices)
     )
@@ -253,10 +235,14 @@ def extract_predicted_letter(model_output_raw, choices):
     """Parse a letter from model output. Returns (letter, is_wrong_format)."""
     single_letter_pattern = re.compile(r"^[A-Za-z]$")
     option_letter_pattern = re.compile(r"^Option\s+([A-Za-z])$", re.IGNORECASE)
+    paren_letter_pattern = re.compile(r"^\(([A-Za-z])\)", re.IGNORECASE)
 
     if single_letter_pattern.fullmatch(model_output_raw):
         return model_output_raw.upper(), False
     m = option_letter_pattern.fullmatch(model_output_raw)
+    if m:
+        return m.group(1).upper(), False
+    m = paren_letter_pattern.match(model_output_raw)
     if m:
         return m.group(1).upper(), False
 
@@ -312,16 +298,19 @@ def main():
 
     for i, item in enumerate(data):
         choices = item["choices"]
-        prompt = build_prompt(item["question"], choices)
+        prompt = build_prompt(item["question"], choices, use_af_prompt=args.use_af_prompt)
 
         rel = item["audio_path"].lstrip("./")
         audio_path = os.path.join(args.audio_root, rel)
 
         messages = [{"role": "user", "content": "<audio>" + prompt}]
+        # For regular model, enable_thinking is False in default decoding False
+        # For thinking model, enable_thinking is True
         text = tokenizer.apply_chat_template(
             messages,
             tokenize=False,
             add_generation_prompt=True,
+            enable_thinking=True,
         )
 
         feature, raw_wavs, audio_nums, split_feature_lens = extract_features(audio_path, fbank, model_args)
@@ -348,6 +337,7 @@ def main():
                 fbank_feature=feature_t,
                 fbank_feature_len=feature_lens_t,
                 raw_wavs=raw_wavs_t,
+                user_prompts=[prompt],
                 max_new_tokens=500,
             )
 

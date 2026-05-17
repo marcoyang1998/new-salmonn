@@ -442,6 +442,11 @@ def get_model_args(checkpoint_path: str):
             num_pause_steps: int = 0
             distinct_pause_embed: bool = False
             use_reasoning_network: bool = False
+            use_qwen3_embedding_model: bool = False
+            qwen3_embedding_model_path: str = ""
+            qwen3_embedding_tokenizer_path: str = ""
+            qwen3_embedding_max_length: int = 2048
+            freeze_qwen3_embedding_model: bool = True
             reasoning_network_dim: int = 1024
 
     return ModelArguments()

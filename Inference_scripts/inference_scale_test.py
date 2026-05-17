@@ -39,6 +39,7 @@ model = SALMONN.from_pretrained(
 fbank = get_fbank(model_args)
 def makeInference(data):
     texts = []
+    user_prompts = []
     audio_paths = []
 
     for sample in data:
@@ -58,6 +59,7 @@ def makeInference(data):
             add_generation_prompt=True
         )
         texts.append(text)
+        user_prompts.append(prompt)
 
     feature, feature_lens, raw_wavs = extract_audio_features(audio_paths, fbank, model, model_args)
 
@@ -69,6 +71,7 @@ def makeInference(data):
         fbank_feature=feature,
         fbank_feature_len=feature_lens,
         raw_wavs=raw_wavs,
+        user_prompts=user_prompts,
         max_new_tokens=5000
     )
 

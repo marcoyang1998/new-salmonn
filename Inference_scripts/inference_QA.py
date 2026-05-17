@@ -232,6 +232,7 @@ for i, item in enumerate(data):
         fbank_feature=feature,
         fbank_feature_len=feature_lens,
         raw_wavs=raw_wavs,
+        user_prompts=[prompt],
         max_new_tokens=500
     )
     

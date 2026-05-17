@@ -7,46 +7,11 @@ from lhotse import Fbank, FbankConfig
 import os
 import json
 from tqdm import tqdm
-from inference_utils import get_prompt, get_audio_path_list, extract_audio_features, get_fbank, prepare_model_inputs, get_model_args
+from inference_utils import get_prompt, get_audio_path_list, extract_audio_features, get_fbank, prepare_model_inputs, get_model_args, OVERRIDE_KEYS, override_args_from_config
 import logging
 
 TOKENIZER_PATH="/mnt/shared-storage-gpfs2/brainllm2-share/xiaoyu/models/Qwen3-8B"
 
-OVERRIDE_KEYS = [
-    "weighted_sum_encoder",
-    "concat_encoder_features",
-    "zipformer_version",
-    "connector_hid_size",
-    "connector_seg_size",
-    "connector_type",
-    "expand_vocab",
-    "inject_temporal_embedding",
-    "inject_temporal_embedding_nl",
-    "temporal_granularity",
-    "encoder_frame_rate",
-    "num_pause_steps",
-    "distinct_pause_embed",
-    "use_reasoning_network",
-    "reasoning_network_dim",
-]
-
-
-def override_args(checkpoint_path: str, default_model_args):
-    config_file = os.path.dirname(checkpoint_path) + "/config.json"
-    if not os.path.exists(config_file):
-        logging.warning(f"Config file {config_file} not found. Using default model args without override.")
-        return default_model_args
-    with open(config_file, "r") as f:
-        config = json.load(f)
-        model_args = config["model_args"]
-    # we pre-define some keys to be overriden
-    for k in OVERRIDE_KEYS:
-        attr = model_args.get(k, None)
-        if attr is not None:
-            setattr(default_model_args, k, attr)
-            print(f"Setting {k} to {attr} as specified in the checkpoint config.")
-    
-    return default_model_args
 
 class InferenceManager:
     def __init__(
@@ -68,7 +33,7 @@ class InferenceManager:
         seed: int = 42,
     ):
         self.model_args = get_model_args(checkpoint_path)
-        self.model_args = override_args(checkpoint_path, self.model_args)
+        self.model_args = override_args_from_config(checkpoint_path, self.model_args)
         self.max_new_tokens = max_new_tokens
         self.device = device
         self.task_filter = task_filter
@@ -109,9 +74,11 @@ class InferenceManager:
             if not batch_data:
                 return
         texts = []
+        user_prompts = []
         audio_paths = []
         for sample in batch_data:
             prompt = get_prompt(sample)
+            user_prompts.append(prompt)
             audio_path_list = get_audio_path_list(sample)
             audio_num = len(audio_path_list)
             audio_paths.extend(audio_path_list)
@@ -149,6 +116,7 @@ class InferenceManager:
                 fbank_feature=features,
                 fbank_feature_len=feature_lens,
                 raw_wavs=raw_wavs,
+                user_prompts=user_prompts,
                 max_new_tokens=self.max_new_tokens,
                 **generation_config,
             )
