@@ -419,40 +419,58 @@ class SALMONN(PreTrainedModel):
         return interleaved, new_audio_embeds_lens
 
     def register_nl_timestamp_tokenizer(self, tokenizer):
-        """Pre-tokenise '<X.X seconds>' strings (0.0-120.0 s at 0.1 s steps) for NL timestamp injection.
+        """Pre-tokenise '<X.X seconds>' strings (0.0–120.0 s at 0.1 s steps) for NL timestamp injection.
 
         Stores token IDs for every possible timestamp as a list of lists so that forward-pass
-        tokenisation is avoided entirely. Must be called before using inject_temporal_embedding_nl.
+        tokenisation is avoided entirely.  Must be called before using inject_temporal_embedding_nl.
         """
         token_ids_list = []
-        for i in range(1201):
+        for i in range(1201):                       # index 0 → 0.0 s, index 10 → 1.0 s, …, index 1200 → 120.0 s
             ts_time = round(i * 0.1, 1)
             ts_str = f"<{ts_time:.1f} seconds>"
             ids = tokenizer(ts_str, add_special_tokens=False)["input_ids"]
             token_ids_list.append(ids)
         self.nl_timestamp_token_ids_list = token_ids_list
-        sample = token_ids_list[10]
+        sample = token_ids_list[10]                 # "<1.0 seconds>"
         print(
             f"[SALMONN] register_nl_timestamp_tokenizer: "
             f"'<1.0 seconds>' -> {len(sample)} tokens {sample}"
         )
 
     def inject_temporal_embeddings_with_natural_language(self, audio_embeds, audio_embeds_lens):
-        """Interleave natural-language timestamp embeddings into audio_embeds."""
+        """Interleave natural-language timestamp embeddings into audio_embeds.
+
+        Every K audio frames, a sequence of embeddings for '<T seconds>' is appended,
+        where T = (block_index + 1) * temporal_granularity.  No vocabulary expansion is
+        required — the base LLM tokenizer encodes the string as regular sub-word tokens.
+
+        Block layout:
+            [a_1 … a_K | <T_1 seconds> tokens] [a_{K+1} … a_{2K} | <T_2 seconds> tokens] …
+
+        Args:
+            audio_embeds:      (bsz, seqlen, dim)
+            audio_embeds_lens: (bsz,) valid frame counts (int64)
+
+        Returns:
+            new_audio_embeds:      (bsz, total_len, dim)
+            new_audio_embeds_lens: (bsz,)
+        """
         assert self.nl_timestamp_token_ids_list is not None, (
             "Call register_nl_timestamp_tokenizer(tokenizer) before using inject_temporal_embedding_nl."
         )
-        K = max(1, round(self.temporal_granularity * self.output_frame_rate))
+        K = max(1, round(self.temporal_granularity * self.output_frame_rate))  # audio frames per stamp
 
         bsz, seqlen, dim = audio_embeds.shape
-        num_blocks = (seqlen + K - 1) // K
+        num_blocks = (seqlen + K - 1) // K  # ceil(seqlen / K)
 
+        # 1. Pad seqlen to multiple of K
         pad_len = num_blocks * K - seqlen
         if pad_len > 0:
             audio_embeds = F.pad(audio_embeds, (0, 0, 0, pad_len))
 
+        # 2. Pre-compute timestamp embeddings for every block
         embed_tokens = self.base_llm.get_input_embeddings()
-        block_ts_embs = []
+        block_ts_embs = []   # list of (ts_len_i, dim) tensors
         ts_lens = []
         for i in range(num_blocks):
             ts_time = round((i + 1) * self.temporal_granularity, 10)
@@ -460,23 +478,25 @@ class SALMONN(PreTrainedModel):
             ts_idx = max(0, min(ts_idx, len(self.nl_timestamp_token_ids_list) - 1))
             ids = torch.tensor(
                 self.nl_timestamp_token_ids_list[ts_idx],
-                dtype=torch.long,
-                device=audio_embeds.device,
+                dtype=torch.long, device=audio_embeds.device
             )
-            emb = embed_tokens(ids).to(audio_embeds.dtype)
+            emb = embed_tokens(ids).to(audio_embeds.dtype)   # (ts_len_i, dim)
             block_ts_embs.append(emb)
             ts_lens.append(emb.shape[0])
 
+        # 3. Interleave: [audio_block | ts_embs] per block, then concatenate along seq dim
         segments = []
         for i in range(num_blocks):
-            audio_block = audio_embeds[:, i * K:(i + 1) * K, :]
-            ts_emb = block_ts_embs[i].unsqueeze(0).expand(bsz, -1, -1)
-            segments.append(torch.cat([audio_block, ts_emb], dim=1))
+            audio_block = audio_embeds[:, i * K:(i + 1) * K, :]          # (bsz, K, dim)
+            ts_emb = block_ts_embs[i].unsqueeze(0).expand(bsz, -1, -1)   # (bsz, ts_len_i, dim)
+            segments.append(torch.cat([audio_block, ts_emb], dim=1))     # (bsz, K+ts_len_i, dim)
 
-        new_audio_embeds = torch.cat(segments, dim=1)
+        new_audio_embeds = torch.cat(segments, dim=1)   # (bsz, total_len, dim)
 
+        # 4. Update valid lengths using cumulative sum of per-block timestamp token counts
         ts_lens_t = torch.tensor(ts_lens, dtype=torch.long, device=audio_embeds.device)
-        ts_cumsum = torch.cumsum(ts_lens_t, dim=0)
+        ts_cumsum = torch.cumsum(ts_lens_t, dim=0)                         # (num_blocks,)
+        num_valid_blocks = (audio_embeds_lens + K - 1) // K                # (bsz,)
         num_valid_blocks = (audio_embeds_lens + K - 1) // K
         num_valid_blocks = num_valid_blocks.clamp(1, num_blocks)
         new_audio_embeds_lens = audio_embeds_lens + ts_cumsum[num_valid_blocks - 1]
