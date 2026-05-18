@@ -2,9 +2,7 @@ import os
 import sys
 import contextlib
 
-from sentence_transformers import SentenceTransformer
-from sentence_transformers.util import batch_to_device
-from transformers import PreTrainedModel, AutoModelForCausalLM, StoppingCriteriaList, StoppingCriteria, AutoFeatureExtractor
+from transformers import PreTrainedModel, AutoModelForCausalLM, StoppingCriteriaList, StoppingCriteria, AutoFeatureExtractor, AutoConfig
 from peft import LoraConfig, TaskType, get_peft_model
 import torch
 from torch import nn
@@ -13,11 +11,38 @@ from torch.nn.utils import rnn
 from typing import List, Optional, Tuple, Union
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from models.reasoning_network import ReasoningNetwork
+from spear_encoder.zipformer_peft import (
+    ZIPFORMER_BALANCED_PEFT_TARGET_MODULES,
+    convert_activation_dropout_and_linear_in_place,
+)
 
 BERT_CKPT="/mnt/shared-storage-gpfs2/brainllm2-share/xiaoyu/models/google-bert--bert-base-uncased"
 
 def is_peft_model(model):
     return getattr(model, "peft_config", None) is not None
+
+
+def apply_zipformer_encoder_peft(audio_encoder, model_args):
+    num_replaced = convert_activation_dropout_and_linear_in_place(audio_encoder.encoder)
+    encoder_lora_config = LoraConfig(
+        r=model_args.encoder_lora_rank,
+        lora_alpha=model_args.encoder_lora_alpha,
+        lora_dropout=model_args.encoder_lora_dropout,
+        target_modules=ZIPFORMER_BALANCED_PEFT_TARGET_MODULES,
+        inference_mode=False,
+    )
+    audio_encoder.encoder = get_peft_model(audio_encoder.encoder, encoder_lora_config)
+    for name, param in audio_encoder.named_parameters():
+        param.requires_grad = "lora_" in name
+
+    num_trainable = sum(param.numel() for param in audio_encoder.parameters() if param.requires_grad)
+    num_param = sum(param.numel() for param in audio_encoder.parameters())
+    print(
+        "[SALMONN] Applied PEFT LoRA to Zipformer encoder "
+        f"with {num_replaced} converted activation-linear blocks; "
+        f"trainable parameters = {num_trainable} ({num_trainable / num_param * 100:.3f}% of the audio encoder)."
+    )
+    return audio_encoder
 
 class StoppingCriteriaSub(StoppingCriteria):
 
@@ -50,6 +75,7 @@ class SALMONN(PreTrainedModel):
     base_model_prefix = "model"
     supports_gradient_checkpointing = True
     _skip_keys_device_placement = ["past_key_values"]
+    _keys_to_ignore_on_load_missing = [r"^qwen3_embedding_model\."]
     _supports_flash_attn = True
     _supports_sdpa = True
     _supports_flex_attn = True
@@ -143,25 +169,11 @@ class SALMONN(PreTrainedModel):
             self.audio_encoder = self.get_audio_encoder(model_args)
         if model_args.audio_encoder_path:
             if self.encoder_type == "zipformer2":
-                import math
-                from spear_encoder.scaling import ScaledLinear_lora
                 info = self.audio_encoder.load_state_dict(
                     torch.load(model_args.audio_encoder_path, map_location="cpu")["model"],
                     strict=False,
                 )
                 print(f"Loading info: {info}")
-                # lora_A / lora_B are not in the SpEAR checkpoint.
-                # With HuggingFace low_cpu_mem_usage=True, missing parameters are
-                # materialised as torch.empty (uninitialized / NaN).  Re-initialise
-                # them here so that the subsequent eval() call (which merges lora
-                # into weight) does not corrupt the loaded weights.
-                # Also force merged=False so the merge/unmerge accounting is correct.
-                for module in self.audio_encoder.modules():
-                    if isinstance(module, ScaledLinear_lora) and module.r > 0:
-                        with torch.no_grad():
-                            nn.init.kaiming_uniform_(module.lora_A, a=math.sqrt(5))
-                            nn.init.zeros_(module.lora_B)
-                        module.merged = False
             elif self.encoder_type == "spear_transformer":
                 info = self.audio_encoder.load_state_dict(
                     torch.load(model_args.audio_encoder_path, map_location="cpu")["model"],
@@ -170,11 +182,7 @@ class SALMONN(PreTrainedModel):
                 print(f"Loading info: {info}")
         encoder_lora = getattr(model_args, "encoder_lora", False)
         if model_args.encoder_type == "zipformer2" and encoder_lora:
-            for name, param in self.audio_encoder.named_parameters():
-                if "lora_A" in name or "lora_B" in name:
-                    param.requires_grad = True
-                else:
-                    param.requires_grad = False
+            self.audio_encoder = apply_zipformer_encoder_peft(self.audio_encoder, model_args)
             # we decided not to set to eval()
             # self.audio_encoder.eval()
         elif model_args.encoder_type == "spear_transformer" and encoder_lora:
@@ -296,42 +304,38 @@ class SALMONN(PreTrainedModel):
         self.num_pause_steps = getattr(model_args, "num_pause_steps", 0)
         self.distinct_pause_embed = getattr(model_args, "distinct_pause_embed", False)
         self.use_reasoning_network = getattr(model_args, "use_reasoning_network", False)
+        self.append_reason_embed_behind_audio = getattr(
+            model_args, "append_reason_embed_behind_audio", False
+        )
         self.use_qwen3_embedding_model = getattr(model_args, "use_qwen3_embedding_model", False)
         self.qwen3_embedding_model = None
+        self.qwen3_embedding_device = None
+        self.qwen3_embedding_model_path = getattr(model_args, "qwen3_embedding_model_path", "")
+        self.qwen3_embedding_attn_implementation = getattr(model_args, "attn_implementation", None)
         self.qwen3_embedding_max_length = getattr(model_args, "qwen3_embedding_max_length", 2048)
         self.freeze_qwen3_embedding_model = getattr(model_args, "freeze_qwen3_embedding_model", True)
         if self.num_pause_steps > 0:
             if self.use_reasoning_network:
                 user_prompt_embed_dim = config.hidden_size
                 if self.use_qwen3_embedding_model:
-                    qwen3_embedding_model_path = getattr(model_args, "qwen3_embedding_model_path", "")
-                    if not qwen3_embedding_model_path:
+                    if not self.qwen3_embedding_model_path:
                         raise ValueError(
                             "use_qwen3_embedding_model=True requires qwen3_embedding_model_path to be set."
                         )
-                    model_kwargs = {"torch_dtype": config.torch_dtype}
-                    if getattr(config, "attn_implementation", None) is not None:
-                        model_kwargs["attn_implementation"] = config.attn_implementation
-                    self.qwen3_embedding_model = SentenceTransformer(
-                        qwen3_embedding_model_path,
+                    embedder_config = AutoConfig.from_pretrained(
+                        self.qwen3_embedding_model_path,
                         local_files_only=True,
-                        model_kwargs={"attn_implementation": "flash_attention_2", "device_map": "auto"},
-                        tokenizer_kwargs={"padding_side": "left"},
                     )
-                    user_prompt_embed_dim = self.qwen3_embedding_model.get_sentence_embedding_dimension()
-                    if self.qwen3_embedding_model.max_seq_length is not None:
+                    user_prompt_embed_dim = getattr(embedder_config, "hidden_size", config.hidden_size)
+                    if getattr(embedder_config, "max_position_embeddings", None) is not None:
                         self.qwen3_embedding_max_length = min(
                             self.qwen3_embedding_max_length,
-                            self.qwen3_embedding_model.max_seq_length,
+                            embedder_config.max_position_embeddings,
                         )
-                    self.qwen3_embedding_model.max_seq_length = self.qwen3_embedding_max_length
-                    if self.freeze_qwen3_embedding_model:
-                        for param in self.qwen3_embedding_model.parameters():
-                            param.requires_grad_(False)
-                        self.qwen3_embedding_model.eval()
                     print(
                         f"[SALMONN] use_qwen3_embedding_model=True, hidden_size={user_prompt_embed_dim}, "
-                        f"max_length={self.qwen3_embedding_max_length}, frozen={self.freeze_qwen3_embedding_model}"
+                        f"max_length={self.qwen3_embedding_max_length}, frozen={self.freeze_qwen3_embedding_model}, "
+                        f"deferred_init=True"
                     )
                 num_layers = getattr(model_args, "reasoning_network_num_layers", 5)
                 reasoning_network_dim = getattr(model_args, "reasoning_network_dim", 1024)
@@ -595,12 +599,7 @@ class SALMONN(PreTrainedModel):
             from spear_encoder.model import MultiKDModel
             from spear_encoder.scaling import ScheduledFloat
             from spear_encoder.subsampling import Conv2dSubsampling
-            # from spear_encoder.zipformer import Zipformer2
-            encoder_lora = getattr(model_args, "encoder_lora", False)
-            if encoder_lora:
-                from spear_encoder.zipformer_lora import Zipformer2
-            else:
-                from spear_encoder.zipformer_layerwise import Zipformer2
+            from spear_encoder.zipformer_layerwise import Zipformer2
             def _to_int_tuple(s: str):
                 return tuple(map(int, s.split(",")))
 
@@ -609,62 +608,25 @@ class SALMONN(PreTrainedModel):
                 out_channels=_to_int_tuple("1280,1280,1280,1280,1280,1280,1280")[0],
                 dropout=ScheduledFloat((0.0, 0.3), (20000.0, 0.1)),
             )
-            if encoder_lora:
-                encoder = Zipformer2(
-                    output_downsampling_factor=1,
-                    downsampling_factor=_to_int_tuple("1,2,4,8,4,2,1"),
-                    num_encoder_layers=_to_int_tuple("1,2,3,4,1,1,1"),
-                    encoder_dim=_to_int_tuple("1280,1280,1280,1280,1280,1280,1280"),
-                    encoder_unmasked_dim=_to_int_tuple("768,768,768,768,768,768,768"),
-                    query_head_dim=_to_int_tuple("32"),
-                    pos_head_dim=_to_int_tuple("4"),
-                    value_head_dim=_to_int_tuple("12"),
-                    pos_dim=48,
-                    num_heads=_to_int_tuple("8,8,8,8,8,8,8"),
-                    feedforward_dim=_to_int_tuple("3840,3840,3840,3840,3840,3840,3840"),
-                    cnn_module_kernel=_to_int_tuple("31,31,15,15,15,31,31"),
-                    dropout=ScheduledFloat((0.0, 0.3), (20000.0, 0.1)),
-                    warmup_batches=4000.0,
-                    causal=False,
-                    chunk_size=_to_int_tuple("-1"),
-                    left_context_frames=_to_int_tuple("-1"),
-                    use_lora=model_args.encoder_lora,
-                    lora_r=model_args.encoder_lora_rank,
-                )
-                num_param = sum([p.numel() for p in encoder.parameters()])
-                num_trainable = 0
-                for name, p in encoder.named_parameters():
-                    if "lora_A" in name or "lora_B" in name:
-                        p.requires_grad = True
-                        num_trainable += p.numel()
-                    else:
-                        p.requires_grad = False
-
-                print(
-                    "A total of {} trainable parameters ({:.3f}% of the audio encoder)".format(
-                        num_trainable, num_trainable / num_param * 100
-                    )
-                )
-            else:
-                encoder = Zipformer2(
-                    output_downsampling_factor=1,
-                    downsampling_factor=_to_int_tuple("1,2,4,8,4,2,1"),
-                    num_encoder_layers=_to_int_tuple("1,2,3,4,1,1,1"),
-                    encoder_dim=_to_int_tuple("1280,1280,1280,1280,1280,1280,1280"),
-                    encoder_unmasked_dim=_to_int_tuple("768,768,768,768,768,768,768"),
-                    query_head_dim=_to_int_tuple("32"),
-                    pos_head_dim=_to_int_tuple("4"),
-                    value_head_dim=_to_int_tuple("12"),
-                    pos_dim=48,
-                    num_heads=_to_int_tuple("8,8,8,8,8,8,8"),
-                    feedforward_dim=_to_int_tuple("3840,3840,3840,3840,3840,3840,3840"),
-                    cnn_module_kernel=_to_int_tuple("31,31,15,15,15,31,31"),
-                    dropout=ScheduledFloat((0.0, 0.3), (20000.0, 0.1)),
-                    warmup_batches=4000.0,
-                    causal=False,
-                    chunk_size=_to_int_tuple("-1"),
-                    left_context_frames=_to_int_tuple("-1"),
-                )
+            encoder = Zipformer2(
+                output_downsampling_factor=1,
+                downsampling_factor=_to_int_tuple("1,2,4,8,4,2,1"),
+                num_encoder_layers=_to_int_tuple("1,2,3,4,1,1,1"),
+                encoder_dim=_to_int_tuple("1280,1280,1280,1280,1280,1280,1280"),
+                encoder_unmasked_dim=_to_int_tuple("768,768,768,768,768,768,768"),
+                query_head_dim=_to_int_tuple("32"),
+                pos_head_dim=_to_int_tuple("4"),
+                value_head_dim=_to_int_tuple("12"),
+                pos_dim=48,
+                num_heads=_to_int_tuple("8,8,8,8,8,8,8"),
+                feedforward_dim=_to_int_tuple("3840,3840,3840,3840,3840,3840,3840"),
+                cnn_module_kernel=_to_int_tuple("31,31,15,15,15,31,31"),
+                dropout=ScheduledFloat((0.0, 0.3), (20000.0, 0.1)),
+                warmup_batches=4000.0,
+                causal=False,
+                chunk_size=_to_int_tuple("-1"),
+                left_context_frames=_to_int_tuple("-1"),
+            )
 
             audio_encoder = MultiKDModel(
                 encoder_embed=encoder_embed,
@@ -927,6 +889,67 @@ class SALMONN(PreTrainedModel):
         last_bos_idx = bos_idx[-1].item()
         return current_input_embeds[last_bos_idx + 2:eos_idx[0]]
 
+    def _get_reasoning_insert_at_behind_audio(self, sample_input_ids, bos_id, total_audio_len):
+        bos_idx = (sample_input_ids == bos_id).nonzero(as_tuple=True)[0]
+        if len(bos_idx) == 0:
+            raise ValueError("No BOS token found when computing reasoning insertion point.")
+        last_bos_idx = bos_idx[-1].item()
+        return last_bos_idx + 2 + total_audio_len
+
+    def state_dict(self, *args, destination=None, prefix="", keep_vars=False):
+        state_dict = super().state_dict(
+            *args,
+            destination=destination,
+            prefix=prefix,
+            keep_vars=keep_vars,
+        )
+        ignored_prefix = f"{prefix}qwen3_embedding_model."
+        for key in [key for key in state_dict if key.startswith(ignored_prefix)]:
+            del state_dict[key]
+        return state_dict
+
+    def init_qwen3_embedding_model(self):
+        if not self.use_qwen3_embedding_model or self.qwen3_embedding_model is not None:
+            return self.qwen3_embedding_model
+
+        from sentence_transformers import SentenceTransformer
+
+        if torch.cuda.is_available():
+            local_rank = os.environ.get("LOCAL_RANK")
+            device_index = int(local_rank) if local_rank is not None else torch.cuda.current_device()
+            self.qwen3_embedding_device = f"cuda:{device_index}"
+
+        model_kwargs = {
+            "dtype": self.config.torch_dtype,
+            "device_map": None,
+            "low_cpu_mem_usage": False,
+        }
+        if self.qwen3_embedding_device is not None and self.qwen3_embedding_attn_implementation is not None:
+            model_kwargs["attn_implementation"] = self.qwen3_embedding_attn_implementation
+
+        self.qwen3_embedding_model = SentenceTransformer(
+            self.qwen3_embedding_model_path,
+            device=None,
+            local_files_only=True,
+            model_kwargs=model_kwargs,
+            processor_kwargs={"padding_side": "left"},
+        )
+        if self.qwen3_embedding_device is not None:
+            self.qwen3_embedding_model.to(self.qwen3_embedding_device)
+        self.qwen3_embedding_device = str(self.qwen3_embedding_model.device)
+        self.qwen3_embedding_model.max_seq_length = self.qwen3_embedding_max_length
+
+        if self.freeze_qwen3_embedding_model:
+            for param in self.qwen3_embedding_model.parameters():
+                param.requires_grad_(False)
+            self.qwen3_embedding_model.eval()
+
+        print(
+            f"[SALMONN] qwen3_embedding_model loaded on {self.qwen3_embedding_device}, "
+            f"max_length={self.qwen3_embedding_max_length}, frozen={self.freeze_qwen3_embedding_model}"
+        )
+        return self.qwen3_embedding_model
+
     def _get_external_user_prompt_embeds(self, user_prompts, device):
         if not self.use_qwen3_embedding_model:
             return None
@@ -934,8 +957,12 @@ class SALMONN(PreTrainedModel):
             raise ValueError(
                 "user_prompts must be provided when use_qwen3_embedding_model=True."
             )
+        from sentence_transformers.util import batch_to_device
+
+        self.init_qwen3_embedding_model()
+        embedder_device = self.qwen3_embedding_model.device
         features = self.qwen3_embedding_model.preprocess(inputs=user_prompts)
-        features = batch_to_device(features, device)
+        features = batch_to_device(features, embedder_device)
         encoded_features = self.qwen3_embedding_model.forward(features)
         embeddings = []
         token_embeddings_batch = encoded_features["token_embeddings"]
@@ -952,6 +979,7 @@ class SALMONN(PreTrainedModel):
             raise ValueError(
                 "user_prompts must be provided when use_qwen3_embedding_model=True."
             )
+        self.init_qwen3_embedding_model()
         prompt_name = None
         embeddings = self.qwen3_embedding_model.encode(
             user_prompts,
@@ -959,10 +987,10 @@ class SALMONN(PreTrainedModel):
             output_value="token_embeddings",
             convert_to_numpy=False,
             convert_to_tensor=False,
-            device=device,
+            device=self.qwen3_embedding_model.device,
             show_progress_bar=False,
         )
-        return embeddings
+        return [embedding.to(device) for embedding in embeddings]
 
     def prepare_inputs_labels_for_speech_with_reasoning(
         self,
@@ -1026,7 +1054,14 @@ class SALMONN(PreTrainedModel):
                 if len(first_response_positions) > 0:
                     reasoning_audio_list.append(current_audio_embed)
                     user_prompt_list.append(current_text_prompt_embed)
-                    reasoning_insert_at.append(first_response_positions[0].item())
+                    if self.append_reason_embed_behind_audio:
+                        reasoning_insert_at.append(
+                            self._get_reasoning_insert_at_behind_audio(
+                                input_ids[i], bos_id, current_audio_embed.shape[0]
+                            )
+                        )
+                    else:
+                        reasoning_insert_at.append(first_response_positions[0].item())
                 else:
                     reasoning_audio_list.append(None)
                     user_prompt_list.append(None)
@@ -1154,9 +1189,30 @@ class SALMONN(PreTrainedModel):
             reasoning_embeds = self.post_reasoning_proj(reasoning_out)  # (B, N, hidden)
             for i in range(bsz):
                 pause_embeds = reasoning_embeds[i].to(input_embeds_list[i].dtype)
-                input_embeds_list[i] = torch.cat([input_embeds_list[i], pause_embeds], dim=0)
                 pause_mask = torch.ones((self.num_pause_steps,), dtype=torch.long, device=device)
-                attention_mask_list[i] = torch.cat([attention_mask_list[i], pause_mask], dim=0)
+                if self.append_reason_embed_behind_audio:
+                    insert_at = self._get_reasoning_insert_at_behind_audio(
+                        input_ids[i], bos_id, reasoning_audio_list[i].shape[0]
+                    )
+                    input_embeds_list[i] = torch.cat(
+                        [
+                            input_embeds_list[i][:insert_at],
+                            pause_embeds,
+                            input_embeds_list[i][insert_at:],
+                        ],
+                        dim=0,
+                    )
+                    attention_mask_list[i] = torch.cat(
+                        [
+                            attention_mask_list[i][:insert_at],
+                            pause_mask,
+                            attention_mask_list[i][insert_at:],
+                        ],
+                        dim=0,
+                    )
+                else:
+                    input_embeds_list[i] = torch.cat([input_embeds_list[i], pause_embeds], dim=0)
+                    attention_mask_list[i] = torch.cat([attention_mask_list[i], pause_mask], dim=0)
         input_embeds = rnn.pad_sequence(input_embeds_list, batch_first=True, padding_side="left")
         attention_mask = rnn.pad_sequence(
             attention_mask_list, batch_first=True, padding_value=0, padding_side="left"
@@ -1184,7 +1240,6 @@ class SALMONN(PreTrainedModel):
                 user_prompts, input_ids.device
             )
         if self.use_reasoning_network and self.num_pause_steps > 0:
-            import pdb; pdb.set_trace()
             return self.prepare_inputs_labels_for_speech_with_reasoning(
                 input_ids,
                 labels,

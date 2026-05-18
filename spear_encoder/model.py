@@ -194,7 +194,7 @@ class MultiKDModel(nn.Module):
         encoder_out, encoder_out_lens, middle_out = self.encoder(x, x_lens, src_key_padding_mask, return_middle_out=True)
 
         encoder_out = encoder_out.permute(1, 0, 2)  # (T, N, C) ->(N, T, C)
-        assert torch.all(encoder_out_lens > 0), (x_lens, encoder_out_lens)
+        assert torch.all(encoder_out_lens > 0), (encoder_out.shape, x_lens, encoder_out_lens)
 
         return encoder_out, encoder_out_lens, middle_out
 

@@ -46,6 +46,7 @@ class ModelArguments:
     inject_temporal_embedding_nl: bool = field(default=False)
     temporal_granularity: float = field(default=0.5, metadata={"help": "Timestamp injection granularity in seconds (e.g. 0.5 → <|0.50|> every 0.5 s)."})
     encoder_frame_rate: int = field(default=50, metadata={"help": "Audio encoder output frame rate in Hz before the connector (e.g. 50 for SPEAR/zipformer2)."})
+    append_reason_embed_behind_audio: bool = field(default=False, metadata={"help": "Whether to append reasoning embeddings behind audio features."})
     use_reasoning_network: bool = field(default=False, metadata={"help": "Whether to insert a reasoning network between the audio encoder and LLM, taking the audio encoder output as input and producing new 'reasoning' tokens to insert into the LLM input. If False, reasoning_network is not used and num_pause_steps just controls how many <PAUSE> tokens are inserted with no additional reasoning features."})
     use_qwen3_embedding_model: bool = field(default=False, metadata={"help": "Whether to use Qwen3-Embedding hidden states instead of base LLM token embeddings for the reasoning network text input."})
     qwen3_embedding_model_path: str = field(default="/mnt/shared-storage-gpfs2/brainllm2-share/xiaoyu/models/Qwen3-Embedding-0.6B", metadata={"help": "Local path to the Qwen3 embedding model used when use_qwen3_embedding_model=True."})
@@ -164,8 +165,11 @@ def load_model_and_dataset(model_args, data_args, training_args):
             config=model_config,
             model_args=model_args,
             #attn_implementation=model_args.attn_implementation,
-            torch_dtype="auto"
+            torch_dtype="auto",
+            low_cpu_mem_usage=False,
         )
+    if model_args.use_reasoning_network and model_args.num_pause_steps > 0 and model_args.use_qwen3_embedding_model:
+        model.init_qwen3_embedding_model()
     dataset = SALMONN_Dataset(data_args, tokenizer, model_args.encoder_type, model_args.llm_type)
     if model_args.inject_temporal_embedding:
         model.register_temporal_tokens(tokenizer)
@@ -197,22 +201,6 @@ def main():
         training_args.lr_scheduler_kwargs["min_lr"] = training_args.min_learning_rate
 
     tokenizer, model, dataset = load_model_and_dataset(model_args, data_args, training_args)
-
-    # lora_A / lora_B are not in the original SpEAR checkpoint and may also not
-    # be in older SALMONN checkpoints (or may have been saved with garbage values
-    # from a previous buggy run).  Re-initialise them here, AFTER from_pretrained
-    # has fully loaded all checkpoint weights, so this always wins.
-    if model_args.encoder_lora and model_args.encoder_type == "zipformer2":
-        from spear_encoder.scaling import ScaledLinear_lora
-        n_reinit = 0
-        for module in model.audio_encoder.modules():
-            if isinstance(module, ScaledLinear_lora) and module.r > 0:
-                with torch.no_grad():
-                    torch.nn.init.kaiming_uniform_(module.lora_A, a=math.sqrt(5))
-                    torch.nn.init.zeros_(module.lora_B)
-                module.merged = False
-                n_reinit += 1
-        print(f"[train] Re-initialised lora_A/lora_B for {n_reinit} ScaledLinear_lora modules.")
 
     # When doing delayed encoder unfreezing, encoder params must have requires_grad=True
     # from the very start so DeepSpeed ZeRO includes them in its partitioning.
