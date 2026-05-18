@@ -69,7 +69,8 @@ class SALMONN_Dataset(Dataset):
         else:
             print(f"[Dataset] max_audio_duration disabled — keeping all {len(self.data):,} entries.", flush=True)
 
-        min_dur = getattr(args, "min_audio_duration", 0.1)
+        min_dur = getattr(args, "min_audio_duration", 0.3)
+        self.min_audio_duration = min_dur
         before_count = len(self.data)
         self.data = [
             e for e in self.data
@@ -206,6 +207,10 @@ class SALMONN_Dataset(Dataset):
     def _verify_chat(self, chats: List[Dict]):
         assert len(chats) == 2, f"Chat should have exactly 2 messages, but got {len(chats)}: {chats}"
         assert "<audio>" in chats[0]["content"], f"The first message should contain the audio placeholder, but got: {chats}"
+        assert chats[0]["content"].startswith("<audio>"), f"The first message should start with the audio placeholder, but got: {chats}"
+
+    def _get_user_prompt(self, chats: List[Dict]) -> str:
+        return chats[0]["content"].replace("<audio>", " ").strip()
     
     def __getitem__(self, index):
         for attempt in range(self.broken_sample_max_retries):
@@ -228,8 +233,18 @@ class SALMONN_Dataset(Dataset):
         fbank_lens = []
         raw_wavs = []
         audio_nums = []
+        audio_files = []
         for audio_path in sample["audios"]:
             audio, fs = self._load_audio(audio_path)
+            duration = audio.shape[1] / fs
+            if duration < self.min_audio_duration:
+                print(
+                    f"[WARN] dAudio too short ({duration:.3f}s < min_audio_duration={self.min_audio_duration}s), "
+                    f"skipping and resampling: {audio_path}",
+                    flush=True,
+                )
+                raise ValueError(f"Audio duration {duration:.3f}s below minimum {self.min_audio_duration}s")
+            audio_files.append(audio_path)
             # some of our audio is not 16k hz, so we first resample them and then truncate it
             if fs != 16000:
                 audio = torchaudio.functional.resample(audio, fs, 16000)
@@ -316,7 +331,6 @@ class SALMONN_Dataset(Dataset):
         else:
             chats = sample["messages"]
         
-        chats = sample["messages"]
         self._verify_chat(chats)
         text = self.tokenizer.apply_chat_template(chats,tokenize=False)
         if self.llm_type == "Qwen":
@@ -357,5 +371,7 @@ class SALMONN_Dataset(Dataset):
         new_sample["fbank_feature"] = fbanks
         new_sample["fbank_feature_len"] = fbank_lens
         new_sample["raw_wavs"] = raw_wavs
+        new_sample["user_prompt"] = [self._get_user_prompt(chats)]
+        new_sample["audio_files"] = audio_files
 
         return new_sample
