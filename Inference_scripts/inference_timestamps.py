@@ -15,7 +15,7 @@ from lhotse import Fbank, FbankConfig
 from transformers import AutoFeatureExtractor
 import os
 import soundfile as sf
-from inference_utils import override_args_from_config
+from inference_utils import ModelArguments, maybe_init_qwen3_embedding_model, override_args_from_config
 
 from petrel_client.client import Client
 
@@ -33,39 +33,6 @@ def load_audio(audio: str):
     else:
         return torchaudio.load(audio)
     
-class ModelArguments:    
-    model_name_or_path: str = "output/test_all_bs192_stage2_step40000_spear_xlarge_token_mix_bf16_concat_encoder_features_True/checkpoint-30000"
-    base_llm_path: str = ""
-    attn_implementation: str = "flash_attention_2"
-    lora: bool = True
-    lora_rank: int = 64
-    lora_alpha: int = 64
-    lora_dropout: float = 0.05
-    dora: bool = False
-    llm_type: str = "Qwen"
-    encoder_type: str = "zipformer2"
-    audio_encoder_path: str = ""
-    freeze_encoder: bool = True
-    connector_type: str = "MLP"
-    connector_seg_size: int = 5
-    connector_hid_size: int = 4096
-    weighted_sum_encoder: bool = False
-    concat_encoder_features: bool = True
-    zipformer_version: str = "xlarge"
-    split_audio: bool = True
-    audio_chunk: int = 120
-    expand_vocab: bool = False
-    inject_temporal_embedding: bool = False
-    inject_temporal_embedding_nl: bool = False
-    temporal_granularity: float = 1.0
-    encoder_frame_rate: int = 50
-    use_reasoning_network: bool = False
-    reasoning_network_num_layers: int = 5
-    reasoning_network_dim: int = 1024
-    num_pause_steps: int = 0
-    distinct_pause_embed: bool = False
-
-
 def str2bool(v):
     if isinstance(v, bool):
         return v
@@ -96,7 +63,11 @@ def parse_args():
     )
     return parser.parse_args()
 
-model_args = ModelArguments()
+model_args = ModelArguments(
+    model_name_or_path="output/test_all_bs192_stage2_step40000_spear_xlarge_token_mix_bf16_concat_encoder_features_True/checkpoint-30000",
+    concat_encoder_features=True,
+    audio_chunk=120,
+)
 args = parse_args()
 model_args.model_name_or_path = args.model_name_or_path
 
@@ -130,6 +101,7 @@ if getattr(model_args, "inject_temporal_embedding", False):
     model.register_temporal_tokens(tokenizer)
 if getattr(model_args, "inject_temporal_embedding_nl", False):
     model.register_nl_timestamp_tokenizer(tokenizer)
+maybe_init_qwen3_embedding_model(model, model_args)
 model.eval()
 if model_args.encoder_type in ("zipformer2", "spear_transformer"):
     fbank = Fbank(FbankConfig(num_mel_bins=128))

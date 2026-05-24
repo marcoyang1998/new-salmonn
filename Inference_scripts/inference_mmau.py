@@ -14,7 +14,7 @@ import torchaudio
 import torch.nn.functional as F
 from transformers import AutoFeatureExtractor
 import soundfile as sf
-from inference_utils import OVERRIDE_KEYS, override_args_from_config
+from inference_utils import ModelArguments, OVERRIDE_KEYS, maybe_init_qwen3_embedding_model, override_args_from_config
 
 
 LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -30,45 +30,6 @@ QUESTION_TEMPLATE = (
 
 # Encoders that share the same Fbank config and chunking logic
 ZIPFORMER_LIKE = {"zipformer2", "spear_transformer"}
-
-
-class ModelArguments:
-    model_name_or_path: str = ""
-    base_llm_path: str = ""
-    attn_implementation: str = "flash_attention_2"
-    lora: bool = True
-    lora_rank: int = 64
-    lora_alpha: int = 64
-    lora_dropout: float = 0.05
-    dora: bool = False
-    llm_type: str = "Qwen"
-    encoder_type: str = "zipformer2"
-    audio_encoder_path: str = ""
-    freeze_encoder: bool = True
-    encoder_lora: bool = False
-    encoder_lora_rank: int = 8
-    encoder_lora_alpha: int = 8
-    encoder_lora_dropout: float = 0.05
-    connector_type: str = "MLP"
-    connector_seg_size: int = 5
-    connector_hid_size: int = 4096
-    weighted_sum_encoder: bool = False
-    concat_encoder_features: bool = False
-    zipformer_version: str = "xlarge"
-    split_audio: bool = True
-    audio_chunk: int = 60
-    expand_vocab: bool = False
-    inject_temporal_embedding: bool = False
-    inject_temporal_embedding_nl: bool = False
-    temporal_granularity: float = 1.0
-    encoder_frame_rate: int = 50
-    use_reasoning_network: bool = False
-    reasoning_network_num_layers: int = 5
-    reasoning_network_dim: int = 1024
-    num_pause_steps: int = 0
-    distinct_pause_embed: bool = False
-
-
 def str2bool(v):
     if isinstance(v, bool):
         return v
@@ -294,6 +255,7 @@ def main():
         torch_dtype="auto",
         device_map="auto",
     )
+    maybe_init_qwen3_embedding_model(model, model_args)
     model.eval()
 
     fbank = get_fbank(model_args)

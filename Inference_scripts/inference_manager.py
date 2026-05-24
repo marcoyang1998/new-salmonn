@@ -7,7 +7,7 @@ from lhotse import Fbank, FbankConfig
 import os
 import json
 from tqdm import tqdm
-from inference_utils import get_prompt, get_audio_path_list, extract_audio_features, get_fbank, prepare_model_inputs, get_model_args, OVERRIDE_KEYS, override_args_from_config
+from inference_utils import get_prompt, get_audio_path_list, extract_audio_features, get_fbank, maybe_init_qwen3_embedding_model, prepare_model_inputs, get_model_args, OVERRIDE_KEYS, override_args_from_config
 import logging
 
 TOKENIZER_PATH="/mnt/shared-storage-gpfs2/brainllm2-share/xiaoyu/models/Qwen3-8B"
@@ -64,6 +64,7 @@ class InferenceManager:
             model.register_temporal_tokens(self.tokenizer)
         if getattr(self.model_args, "inject_temporal_embedding_nl", False):
             model.register_nl_timestamp_tokenizer(self.tokenizer)
+        maybe_init_qwen3_embedding_model(model, self.model_args)
         model.eval()
         return model
 

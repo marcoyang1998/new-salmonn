@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 from lhotse import Fbank, FbankConfig
 import torchaudio
 import torch
@@ -9,10 +10,59 @@ import json
 import logging
 import os
 
+
+@dataclass
+class ModelArguments:
+    model_name_or_path: str = ""
+    base_llm_path: str = ""
+    llm_type: str = "Qwen"
+    attn_implementation: str = "flash_attention_2"
+    lora: bool = True
+    lora_rank: int = 64
+    lora_alpha: int = 64
+    lora_dropout: float = 0.05
+    dora: bool = False
+    encoder_type: str = "zipformer2"
+    audio_encoder_path: str = ""
+    speech_encoder_path: str = ""
+    freeze_encoder: bool = True
+    connector_type: str = "MLP"
+    connector_seg_size: int = 5
+    connector_hid_size: int = 4096
+    weighted_sum_encoder: bool = False
+    concat_encoder_features: bool = False
+    zipformer_version: str = "xlarge"
+    split_audio: bool = True
+    audio_chunk: int = 60
+    expand_vocab: bool = False
+    inject_temporal_embedding: bool = False
+    inject_temporal_embedding_nl: bool = False
+    temporal_granularity: float = 1.0
+    encoder_frame_rate: int = 50
+    append_reason_embed_behind_audio: bool = False
+    use_reasoning_network: bool = False
+    use_qwen3_embedding_model: bool = False
+    qwen3_embedding_model_path: str = ""
+    qwen3_embedding_tokenizer_path: str = ""
+    qwen3_embedding_max_length: int = 2048
+    freeze_qwen3_embedding_model: bool = True
+    reasoning_network_num_layers: int = 5
+    reasoning_network_dim: int = 1024
+    num_pause_steps: int = 0
+    distinct_pause_embed: bool = False
+    encoder_lora: bool = False
+    encoder_lora_rank: int = 8
+    encoder_lora_alpha: int = 8
+    encoder_lora_dropout: float = 0.05
+
 OVERRIDE_KEYS = [
+    "llm_type",
     "weighted_sum_encoder",
     "concat_encoder_features",
     "zipformer_version",
+    "audio_encoder_path",
+    "speech_encoder_path",
+    "freeze_encoder",
     "connector_hid_size",
     "connector_seg_size",
     "connector_type",
@@ -20,8 +70,10 @@ OVERRIDE_KEYS = [
     "inject_temporal_embedding",
     "inject_temporal_embedding_nl",
     "temporal_granularity",
+    "encoder_frame_rate",
     "num_pause_steps",
     "distinct_pause_embed",
+    "append_reason_embed_behind_audio",
     "use_reasoning_network",
     "use_qwen3_embedding_model",
     "qwen3_embedding_model_path",
@@ -55,11 +107,40 @@ def override_args_from_config(checkpoint_path: str, model_args):
             print(f"Setting {k} to {val} from checkpoint config.")
     return model_args
 
+
+def maybe_init_qwen3_embedding_model(model, model_args):
+    if (
+        getattr(model_args, "use_reasoning_network", False)
+        and getattr(model_args, "num_pause_steps", 0) > 0
+        and getattr(model_args, "use_qwen3_embedding_model", False)
+    ):
+        model.init_qwen3_embedding_model()
+
+
+def _apply_model_args_overrides(model_args, **kwargs):
+    for key, value in kwargs.items():
+        setattr(model_args, key, value)
+    return model_args
+
 audio_chunk = 30 * 16000
 max_frames = 120 * 16000
 
 def get_prompt(sample: dict) -> str:
     task = sample["task"]
+
+    if task == "contextualised_asr":
+        bias_words = sample.get("biasing_list", [])
+        if isinstance(bias_words, list):
+            bias_words_text = ", ".join(str(w) for w in bias_words)
+        else:
+            bias_words_text = str(bias_words)
+        if not bias_words_text:
+            bias_words_text = "(none)"
+        return (
+            "Recognize the speech and give me the transcription.\n"
+            "Here is a list of reference words that might appear in the transcript: "
+            f"{bias_words_text}"
+        )
     
     if task in ["gender_QA", "QA", "MC_QA"]:
         prompt_template = "{}"
@@ -244,209 +325,76 @@ def get_fbank(model_args) -> Fbank:
         return AutoFeatureExtractor.from_pretrained("/mnt/bn/audio-visual-llm-data6/ckpts/audio-flamingo-3-hf")
 
 def get_model_args(checkpoint_path: str):
+    model_args = ModelArguments(model_name_or_path=checkpoint_path)
+
     if "dasheng_wavlm" in checkpoint_path:
-        # inference with dashengwavlm
-        class ModelArguments:
-            model_name_or_path: str = checkpoint_path
-            base_llm_path: str = ""
-            attn_implementation: str = "flash_attention_2"
-            lora: bool = True
-            lora_rank: int = 64
-            lora_alpha: int = 64
-            lora_dropout: float = 0.05
-            dora: bool = False
-            llm_type: str = "Qwen"
-            encoder_type: str = "dasheng_wavlm"
-            audio_encoder_path: str = "/mnt/bn/audio-visual-llm-data6/wangsiyin/SALMONN/dasheng"
-            speech_encoder_path: str = "/mnt/bn/audio-visual-llm-data6/wangsiyin/SALMONN/wavlm"
-            freeze_encoder: bool = True
-            connector_type: str = "MLP"
-            connector_seg_size: int = 5
-            connector_hid_size: int = 8192
+        return _apply_model_args_overrides(
+            model_args,
+            encoder_type="dasheng_wavlm",
+            audio_encoder_path="/mnt/bn/audio-visual-llm-data6/wangsiyin/SALMONN/dasheng",
+            speech_encoder_path="/mnt/bn/audio-visual-llm-data6/wangsiyin/SALMONN/wavlm",
+            connector_hid_size=8192,
+        )
 
     elif "whisper_beats" in checkpoint_path:
-        class ModelArguments:
-            model_name_or_path: str = checkpoint_path
-            base_llm_path: str = ""
-            attn_implementation: str = "flash_attention_2"
-            lora: bool = True
-            lora_rank: int = 64
-            lora_alpha: int = 64
-            lora_dropout: float = 0.05
-            dora: bool = False
-            llm_type: str = "Qwen"
-            encoder_type: str = "whisper_beats"
-            audio_encoder_path: str = "/mnt/bn/audio-visual-llm-data/tangchangli/beats/BEATs_iter3_plus_AS2M_finetuned_on_AS2M_cpt2.pt"
-            speech_encoder_path: str = "/mnt/bn/audio-visual-llm-data/yuwenyi/ckpt/whisper/whisper_large_v2"
-            freeze_encoder: bool = True
-            connector_type: str = "MLP"
-            connector_seg_size: int = 5
-            connector_hid_size: int = 6400
+        return _apply_model_args_overrides(
+            model_args,
+            encoder_type="whisper_beats",
+            audio_encoder_path="/mnt/bn/audio-visual-llm-data/tangchangli/beats/BEATs_iter3_plus_AS2M_finetuned_on_AS2M_cpt2.pt",
+            speech_encoder_path="/mnt/bn/audio-visual-llm-data/yuwenyi/ckpt/whisper/whisper_large_v2",
+            connector_hid_size=6400,
+        )
     
     elif "whisper" in checkpoint_path:
-        class ModelArguments:
-            model_name_or_path: str = checkpoint_path
-            base_llm_path: str = ""
-            attn_implementation: str = "flash_attention_2"
-            lora: bool = True
-            lora_rank: int = 64
-            lora_alpha: int = 64
-            lora_dropout: float = 0.05
-            dora: bool = False
-            llm_type: str = "Qwen"
-            encoder_type: str = "whisper"
-            audio_encoder_path: str = "/mnt/bn/audio-visual-llm-data/yuwenyi/ckpt/whisper/whisper_large_v2"
-            freeze_encoder: bool = True
-            connector_type: str = "MLP"
-            connector_seg_size: int = 5
-            connector_hid_size: int = 6400
+        return _apply_model_args_overrides(
+            model_args,
+            encoder_type="whisper",
+            audio_encoder_path="/mnt/bn/audio-visual-llm-data/yuwenyi/ckpt/whisper/whisper_large_v2",
+            connector_hid_size=6400,
+        )
 
     elif "qwen3" in checkpoint_path and "omni" in checkpoint_path:
-        class ModelArguments:
-            model_name_or_path: str = checkpoint_path
-            base_llm_path: str = ""
-            attn_implementation: str = "flash_attention_2"
-            lora: bool = True
-            lora_rank: int = 64
-            lora_alpha: int = 64
-            lora_dropout: float = 0.05
-            dora: bool = False
-            llm_type: str = "Qwen"
-            encoder_type: str = "qwen3omni"
-            audio_encoder_path: str = "/mnt/bn/audio-visual-llm-data6/ckpts/Qwen3-Omni-30B-A3B-Instruct"
-            speech_encoder_path: str = ""
-            freeze_encoder: bool = True
-            connector_type: str = "MLP"
-            connector_seg_size: int = 5
-            connector_hid_size: int = 8192
+        return _apply_model_args_overrides(
+            model_args,
+            encoder_type="qwen3omni",
+            audio_encoder_path="/mnt/bn/audio-visual-llm-data6/ckpts/Qwen3-Omni-30B-A3B-Instruct",
+            connector_hid_size=8192,
+        )
 
     elif "qwen" in checkpoint_path and "omni" in checkpoint_path:
-        class ModelArguments:
-            model_name_or_path: str = checkpoint_path
-            base_llm_path: str = ""
-            attn_implementation: str = "flash_attention_2"
-            lora: bool = True
-            lora_rank: int = 64
-            lora_alpha: int = 64
-            lora_dropout: float = 0.05
-            dora: bool = False
-            llm_type: str = "Qwen"
-            encoder_type: str = "qwenomni"
-            audio_encoder_path: str = "/mnt/bn/audio-visual-llm-data5/wangsiyin/models/Qwen2.5-Omni-7B"
-            speech_encoder_path: str = ""
-            freeze_encoder: bool = True
-            connector_type: str = "MLP"
-            connector_seg_size: int = 5
-            connector_hid_size: int = 8192
+        return _apply_model_args_overrides(
+            model_args,
+            encoder_type="qwenomni",
+            audio_encoder_path="/mnt/bn/audio-visual-llm-data5/wangsiyin/models/Qwen2.5-Omni-7B",
+            connector_hid_size=8192,
+        )
     
     elif "mimo" in checkpoint_path:
-        class ModelArguments:
-            model_name_or_path: str = checkpoint_path
-            base_llm_path: str = ""
-            attn_implementation: str = "flash_attention_2"
-            lora: bool = True
-            lora_rank: int = 64
-            lora_alpha: int = 64
-            lora_dropout: float = 0.05
-            dora: bool = False
-            llm_type: str = "Qwen"
-            encoder_type: str = "mimo"
-            audio_encoder_path: str = "/mnt/bn/audio-visual-llm-data6/ckpts/MiMo-Audio-Tokenizer"
-            speech_encoder_path: str = ""
-            freeze_encoder: bool = True
-            connector_type: str = "MLP"
-            connector_seg_size: int = 5
-            connector_hid_size: int = 4096
+        return _apply_model_args_overrides(
+            model_args,
+            encoder_type="mimo",
+            audio_encoder_path="/mnt/bn/audio-visual-llm-data6/ckpts/MiMo-Audio-Tokenizer",
+        )
     
     elif "perception_av" in checkpoint_path:
-        class ModelArguments:
-            model_name_or_path: str = checkpoint_path
-            base_llm_path: str = ""
-            attn_implementation: str = "flash_attention_2"
-            lora: bool = True
-            lora_rank: int = 64
-            lora_alpha: int = 64
-            lora_dropout: float = 0.05
-            dora: bool = False
-            llm_type: str = "Qwen"
-            encoder_type: str = "perception_av"
-            audio_encoder_path: str = "/mnt/bn/audio-visual-llm-data6/ckpts/pe-av-large"
-            speech_encoder_path: str = ""
-            freeze_encoder: bool = True
-            connector_type: str = "MLP"
-            connector_seg_size: int = 5
-            connector_hid_size: int = 4096
+        return _apply_model_args_overrides(
+            model_args,
+            encoder_type="perception_av",
+            audio_encoder_path="/mnt/bn/audio-visual-llm-data6/ckpts/pe-av-large",
+        )
 
     elif "audio_flamingo" in checkpoint_path:
-        class ModelArguments:
-            model_name_or_path: str = checkpoint_path
-            base_llm_path: str = ""
-            attn_implementation: str = "flash_attention_2"
-            lora: bool = True
-            lora_rank: int = 64
-            lora_alpha: int = 64
-            lora_dropout: float = 0.05
-            dora: bool = False
-            llm_type: str = "Qwen"
-            encoder_type: str = "audio_flamingo"
-            audio_encoder_path: str = "/mnt/bn/audio-visual-llm-data6/ckpts/audio-flamingo-3-hf"
-            speech_encoder_path: str = ""
-            freeze_encoder: bool = True
-            connector_type: str = "MLP"
-            connector_seg_size: int = 5
-            connector_hid_size: int = 4096
+        return _apply_model_args_overrides(
+            model_args,
+            encoder_type="audio_flamingo",
+            audio_encoder_path="/mnt/bn/audio-visual-llm-data6/ckpts/audio-flamingo-3-hf",
+        )
 
     elif "spear_transformer" in checkpoint_path:
-        class ModelArguments:
-            model_name_or_path: str = checkpoint_path
-            base_llm_path: str = ""
-            attn_implementation: str = "flash_attention_2"
-            lora: bool = True
-            lora_rank: int = 64
-            lora_alpha: int = 64
-            lora_dropout: float = 0.05
-            dora: bool = False
-            llm_type: str = "Qwen"
-            encoder_type: str = "spear_transformer"
-            audio_encoder_path: str = ""
-            speech_encoder_path: str = ""
-            freeze_encoder: bool = True
-            connector_type: str = "MLP"
-            connector_seg_size: int = 5
-            connector_hid_size: int = 4096
-            concat_encoder_features: bool = True
-            expand_vocab: bool = False
-            inject_temporal_embedding: bool = False
+        return _apply_model_args_overrides(
+            model_args,
+            encoder_type="spear_transformer",
+            concat_encoder_features=True,
+        )
 
-    else:
-        class ModelArguments:
-            model_name_or_path: str = checkpoint_path
-            base_llm_path: str = ""
-            attn_implementation: str = "flash_attention_2"
-            lora: bool = True
-            lora_rank: int = 64
-            lora_alpha: int = 64
-            lora_dropout: float = 0.05
-            dora: bool = False
-            llm_type: str = "Qwen"
-            encoder_type: str = "zipformer2"
-            audio_encoder_path: str = ""
-            freeze_encoder: bool = True
-            connector_type: str = "MLP"
-            connector_seg_size: int = 5
-            connector_hid_size: int = 4096
-            concat_encoder_features: bool = False
-            zipformer_version: str = "xlarge"
-            expand_vocab: bool = False
-            inject_temporal_embedding: bool = False
-            num_pause_steps: int = 0
-            distinct_pause_embed: bool = False
-            use_reasoning_network: bool = False
-            use_qwen3_embedding_model: bool = False
-            qwen3_embedding_model_path: str = ""
-            qwen3_embedding_tokenizer_path: str = ""
-            qwen3_embedding_max_length: int = 2048
-            freeze_qwen3_embedding_model: bool = True
-            reasoning_network_dim: int = 1024
-
-    return ModelArguments()
+    return model_args

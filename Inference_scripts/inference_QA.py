@@ -4,7 +4,6 @@ import re
 import warnings
 import argparse
 
-from dataclasses import dataclass, field, asdict
 from modeling_salmonn import SALMONN
 from lhotse import Fbank, FbankConfig
 from transformers import AutoConfig, AutoTokenizer
@@ -15,50 +14,7 @@ from lhotse import Fbank, FbankConfig
 from transformers import AutoFeatureExtractor
 import os
 import soundfile as sf
-
-# class ModelArguments:
-#     model_name_or_path: str = "/mnt/bn/audio-visual-llm-data6/wangsiyin/SALMONN/output/test_stage1_bs256_step20000_30s_whisper_beats_seperate_layernorm/checkpoint-10000"
-#     base_llm_path: str = ""
-#     attn_implementation: str = "flash_attention_2"
-#     lora: bool = True
-#     lora_rank: int = 64
-#     lora_alpha: int = 64
-#     lora_dropout: float = 0.05
-#     llm_type: str = "Qwen"
-#     encoder_type: str = "whisper_beats"
-#     audio_encoder_path: str = "/mnt/bn/audio-visual-llm-data6/ckpts/beats/BEATs_iter3_plus_AS2M.pt"
-#     speech_encoder_path: str = "/mnt/bn/audio-visual-llm-data/yuwenyi/ckpt/whisper/whisper_large_v2"
-#     freeze_encoder: bool = True
-#     connector_type: str = "MLP"
-#     connector_seg_size: int = 5
-#     connector_hid_size: int = 6400
-    
-class ModelArguments:
-    # model_name_or_path: str = "output/test_stage2_step30000_120s_with_MS_spear_xlarge_token_mix_bf16/checkpoint-30000"
-    # model_name_or_path: str = "output/test_stage2_step30000_120s_MC_data_only_json_format_v1_spear_xlarge_token_mix_bf16/checkpoint-30000"
-    # model_name_or_path: str = "output/test_stage2_bs192_step30000_v1_data_GeminiQA_120s_spear_xlarge_token_mix_bf16/checkpoint-30000"
-    # model_name_or_path: str = "output/test_stage2_bs192_step30000_v1_data_with_MC_one_letter_120s_spear_xlarge_token_mix_bf16/checkpoint-10000"
-    model_name_or_path: str = "output/test_stage2_bs192_step30000_v1_data_120s_spear_xlarge_token_mix_bf16_reproduce/checkpoint-30000"
-    base_llm_path: str = ""
-    attn_implementation: str = "flash_attention_2"
-    lora: bool = True
-    lora_rank: int = 64
-    lora_alpha: int = 64
-    lora_dropout: float = 0.05
-    dora: bool = False
-    llm_type: str = "Qwen"
-    encoder_type: str = "zipformer2"
-    audio_encoder_path: str = ""
-    freeze_encoder: bool = True
-    connector_type: str = "MLP"
-    connector_seg_size: int = 5
-    connector_hid_size: int = 4096
-    weighted_sum_encoder: bool = False
-    concat_encoder_features: bool = False
-    zipformer_version: str = "xlarge"
-    split_audio: bool = True
-    audio_chunk: int = 120
-
+from inference_utils import ModelArguments, maybe_init_qwen3_embedding_model
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Run QA inference with SALMONN")
@@ -74,7 +30,10 @@ def parse_args():
     )
     return parser.parse_args()
 
-model_args = ModelArguments()
+model_args = ModelArguments(
+    model_name_or_path="output/test_stage2_bs192_step30000_v1_data_120s_spear_xlarge_token_mix_bf16_reproduce/checkpoint-30000",
+    audio_chunk=120,
+)
 args = parse_args()
 model_args.model_name_or_path = args.model_name_or_path
 model_args.concat_encoder_features = args.concat_encoder_features
@@ -89,6 +48,7 @@ model = SALMONN.from_pretrained(
     torch_dtype="auto",
     device_map="auto"
 )
+maybe_init_qwen3_embedding_model(model, model_args)
 model.eval()
 if model_args.encoder_type == "zipformer2":
     fbank = Fbank(FbankConfig(num_mel_bins=128))

@@ -8,6 +8,7 @@ from argparse import ArgumentParser
 from pathlib import Path
 
 TOKENIZER_PATH="/mnt/shared-storage-gpfs2/brainllm2-share/xiaoyu/models/Qwen3-8B"
+DEFAULT_WRITE_PATH_PARENT = "/mnt/shared-storage-gpfs2/brainllm2-share/xiaoyu/SALMONN_wenyi/results"
 
 logging.basicConfig(level=logging.ERROR, force=True)
 
@@ -120,6 +121,7 @@ if __name__ == "__main__":
     parser.add_argument("--tasks_to_infer", nargs="+", type=str, default=default_tasks)
     parser.add_argument("--split_audio", type=bool, default=False)
     # REQUIRED settings
+    parser.add_argument("--results_folder", type=str, default =DEFAULT_WRITE_PATH_PARENT, required=True)
     parser.add_argument("--write_path_title", type=str, default = None, required=True)
     parser.add_argument("--checkpoint_path", type=str, default=None, required=True) # it will automatically know which model_argument to use from this
     parser.add_argument("--disable_thinking", type=str2bool, default=True, help="If True, we forced the model to skip thinking")
@@ -138,16 +140,14 @@ if __name__ == "__main__":
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
-    DEFAULT_WRITE_PATH_PARENT = "/mnt/shared-storage-gpfs2/brainllm2-share/xiaoyu/SALMONN_wenyi/results"
-
     if args.debug:
         args.test_set_path = Path("/mnt/bn/audio-visual-llm-data/datasets/multitask_json/test_debug.json")
-        DEFAULT_WRITE_PATH_PARENT = "/mnt/bn/audio-visual-llm-data6/terumi/SALMONNv1.1/logs/debug/"
+        args.results_folder = "/mnt/bn/audio-visual-llm-data6/terumi/SALMONNv1.1/logs/debug/"
         args.write_path_title = f"debug_{args.write_path_title}"
         args.batch_size = 2
         args.worker_num = 1
     
-    write_path = Path(DEFAULT_WRITE_PATH_PARENT) / f"{args.write_path_title}.jsonl"
+    write_path = Path(args.results_folder) / f"{args.write_path_title}.jsonl"
 
     write_path.parent.mkdir(parents = True, exist_ok = True)
 

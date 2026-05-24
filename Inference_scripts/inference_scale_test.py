@@ -1,4 +1,3 @@
-from dataclasses import dataclass, field, asdict
 from modeling_salmonn import SALMONN
 from lhotse import Fbank, FbankConfig
 from transformers import AutoConfig, AutoTokenizer
@@ -8,25 +7,11 @@ from lhotse import Fbank, FbankConfig
 import os
 from pdb import set_trace
 # from inference_serial_test_set import get_prompt
-from inference_utils import get_prompt, get_audio_path_list, extract_audio_features, prepare_model_inputs, get_fbank
+from inference_utils import ModelArguments, extract_audio_features, get_audio_path_list, get_fbank, get_prompt, maybe_init_qwen3_embedding_model, prepare_model_inputs
 
-class ModelArguments:
-    model_name_or_path: str = "/mnt/bn/audio-visual-llm-data6/wangsiyin/SALMONN/output/arnold_all_bs192_step40000_2s/checkpoint-30000"
-    base_llm_path: str = ""
-    attn_implementation: str = "flash_attention_2"
-    lora: bool = True
-    lora_rank: int = 64
-    lora_alpha: int = 64
-    lora_dropout: float = 0.05
-    dora: bool = False
-    encoder_type: str = "zipformer2"
-    audio_encoder_path: str = ""
-    freeze_encoder: bool = True
-    connector_type: str = "MLP"
-    connector_seg_size: int = 5
-    connector_hid_size: int = 4096
-
-model_args = ModelArguments()
+model_args = ModelArguments(
+    model_name_or_path="/mnt/bn/audio-visual-llm-data6/wangsiyin/SALMONN/output/arnold_all_bs192_step40000_2s/checkpoint-30000",
+)
 tokenizer = AutoTokenizer.from_pretrained("/mnt/bn/audio-visual-llm-data6/ckpts/Qwen3-8B")
 tokenizer.padding_side = "left"
 model = SALMONN.from_pretrained(
@@ -36,6 +21,7 @@ model = SALMONN.from_pretrained(
     torch_dtype="auto",
     device_map=0
 )
+maybe_init_qwen3_embedding_model(model, model_args)
 fbank = get_fbank(model_args)
 def makeInference(data):
     texts = []
