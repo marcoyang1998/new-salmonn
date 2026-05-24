@@ -131,15 +131,17 @@ def get_prompt(sample: dict) -> str:
     if task == "contextualised_asr":
         bias_words = sample.get("biasing_list", [])
         if isinstance(bias_words, list):
-            bias_words_text = ", ".join(str(w) for w in bias_words)
+            bias_words_text = f"[{', '.join(str(w) for w in bias_words)}]"
         else:
-            bias_words_text = str(bias_words)
+            bias_words_text = f"[{str(bias_words)}]"
         if not bias_words_text:
-            bias_words_text = "(none)"
+            bias_words_text = "[]"
         return (
             "Recognize the speech and give me the transcription.\n"
-            "Here is a list of reference words that might appear in the transcript: "
-            f"{bias_words_text}"
+            "Pay extra attention to the following contextual words:\n"
+            "<biasing_list>\n"
+            f"{bias_words_text}\n"
+            "</biasing_list>."
         )
     
     if task in ["gender_QA", "QA", "MC_QA"]:

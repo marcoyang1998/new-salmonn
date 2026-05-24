@@ -4,6 +4,7 @@ import json
 import math
 import random
 import string
+import copy
 from typing import List, Dict
 
 import torch
@@ -211,6 +212,35 @@ class SALMONN_Dataset(Dataset):
 
     def _get_user_prompt(self, chats: List[Dict]) -> str:
         return chats[0]["content"].replace("<audio>", " ").strip()
+
+    def _build_contextual_asr_messages(self, sample: Dict) -> List[Dict]:
+        chats = copy.deepcopy(sample["messages"])
+        biasing_list = sample.get("biasing_list", [])
+        if not chats or not isinstance(chats[0], dict):
+            return chats
+        if not biasing_list:
+            return chats
+
+        shuffled_biasing_list = [str(word) for word in biasing_list]
+        random.shuffle(shuffled_biasing_list)
+        biasing_text = f"[{', '.join(shuffled_biasing_list)}]"
+        if not biasing_text:
+            return chats
+
+        user_content = chats[0].get("content", "")
+        user_content = user_content.rstrip()
+        if user_content and user_content[-1] not in ".!?:":
+            user_content += "."
+        if user_content:
+            user_content += "\n"
+        user_content += (
+            "Pay extra attention to the following contextual words:\n"
+            "<biasing_list>\n"
+            f"{biasing_text}\n"
+            "</biasing_list>."
+        )
+        chats[0]["content"] = user_content
+        return chats
     
     def __getitem__(self, index):
         for attempt in range(self.broken_sample_max_retries):
@@ -328,6 +358,8 @@ class SALMONN_Dataset(Dataset):
         
         if sample.get("task_type") == "qa_mc" and "mc_options" in sample and "mc_question" in sample:
             chats = self._build_mc_messages(sample)
+        elif sample.get("task_type") == "contextual_ASR":
+            chats = self._build_contextual_asr_messages(sample)
         else:
             chats = sample["messages"]
         
