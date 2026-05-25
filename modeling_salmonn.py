@@ -172,12 +172,14 @@ class SALMONN(PreTrainedModel):
                 info = self.audio_encoder.load_state_dict(
                     torch.load(model_args.audio_encoder_path, map_location="cpu")["model"],
                     strict=False,
+                    assign=True,
                 )
                 print(f"Loading info: {info}")
             elif self.encoder_type == "spear_transformer":
                 info = self.audio_encoder.load_state_dict(
                     torch.load(model_args.audio_encoder_path, map_location="cpu")["model"],
                     strict=False,
+                    assign=True,
                 )
                 print(f"Loading info: {info}")
         encoder_lora = getattr(model_args, "encoder_lora", False)
@@ -698,15 +700,49 @@ class SALMONN(PreTrainedModel):
 
         return audio_encoder
 
-    def encode_audio(self, fbank_feature, fbank_feature_len, raw_wavs, freeze_encoder=None):
+    def _get_audio_encoder_autocast_dtype(self):
+        encoder_dtype = next(self.audio_encoder.parameters()).dtype
+        autocast_dtype = encoder_dtype
+        if self.encoder_type == "spear_transformer" and encoder_dtype not in (torch.float16, torch.bfloat16):
+            autocast_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+        return autocast_dtype
+
+    def _forward_audio_encoder_raw(self, fbank_feature, fbank_feature_len, freeze_encoder):
+        audio_embeds, encoder_out_lens, middle_out = self.audio_encoder.forward_encoder(
+            fbank_feature[:, : max(fbank_feature_len), :],
+            fbank_feature_len,
+        )
+        return audio_embeds, encoder_out_lens.to(torch.int64), middle_out
+
+    def encode_audio_raw_encoder(self, fbank_feature, fbank_feature_len, freeze_encoder=None):
+        if self.encoder_type not in ("zipformer2", "spear_transformer"):
+            raise NotImplementedError(
+                "encode_audio_raw_encoder is only supported for zipformer2 and spear_transformer."
+            )
         if freeze_encoder is None:
             freeze_encoder = self._encoder_frozen
-        with self.maybe_autocast(next(self.audio_encoder.parameters()).dtype):
+
+        with self.maybe_autocast(self._get_audio_encoder_autocast_dtype()):
+            with torch.set_grad_enabled(not freeze_encoder):
+                audio_embeds, encoder_out_lens, middle_out = self._forward_audio_encoder_raw(
+                    fbank_feature,
+                    fbank_feature_len,
+                    freeze_encoder,
+                )
+
+        return audio_embeds, encoder_out_lens.to(torch.int64)
+
+    def encode_audio(self, fbank_feature, fbank_feature_len, raw_wavs, freeze_encoder=None, use_mlp_connector=True):
+        if freeze_encoder is None:
+            freeze_encoder = self._encoder_frozen
+
+        with self.maybe_autocast(self._get_audio_encoder_autocast_dtype()):
             if self.encoder_type == "zipformer2":
                 with torch.set_grad_enabled(not freeze_encoder):
                     audio_embeds, encoder_out_lens, middle_out = self.audio_encoder.forward_encoder(
-                        fbank_feature[:,:max(fbank_feature_len),:],
-                        fbank_feature_len
+                        fbank_feature[:, : max(fbank_feature_len), :],
+                        fbank_feature_len,
                     )
                 if self.concat_encoder_features:
                     # assert not self.weighted_sum_encoder
@@ -715,21 +751,24 @@ class SALMONN(PreTrainedModel):
                     middle_out = torch.cat(middle_out, dim=-1) # (N,T,num_layers * C)
                     audio_embeds = self.concat_proj(middle_out) # (N,T,C)
                 audio_embeds = self.ln_audio(audio_embeds)
+                raw_audio_embeds_len = encoder_out_lens.to(torch.int64)
             if self.encoder_type == "spear_transformer":
                 with torch.set_grad_enabled(not freeze_encoder):
                     audio_embeds, encoder_out_lens, middle_out = self.audio_encoder.forward_encoder(
-                        fbank_feature[:,:max(fbank_feature_len),:], 
-                        fbank_feature_len
+                        fbank_feature[:, : max(fbank_feature_len), :],
+                        fbank_feature_len,
                     )
                 if self.concat_encoder_features:
                     middle_out = [F.layer_norm(m, (m.shape[-1],)) for m in middle_out]
                     middle_out = torch.cat(middle_out, dim=-1) # (N,T,num_layers * C)
                     audio_embeds = self.concat_proj(middle_out) # (N,T,C)
                 audio_embeds = self.ln_audio(audio_embeds)
+                raw_audio_embeds_len = encoder_out_lens.to(torch.int64)
             elif self.encoder_type == "dasheng":
                 with torch.set_grad_enabled(not freeze_encoder):
                     audio_embeds = self.audio_encoder(fbank_feature.transpose(1, 2)).hidden_states
                 audio_embeds = self.ln_audio(audio_embeds)
+                raw_audio_embeds_len = torch.ceil(fbank_feature_len / 4).to(torch.int64)
             elif self.encoder_type == "dasheng_wavlm":
                 with torch.set_grad_enabled(not freeze_encoder):
                     fbanks = self.fbank(fbank_feature, return_tensors="pt", device=fbank_feature.device).input_values
@@ -749,6 +788,7 @@ class SALMONN(PreTrainedModel):
                 speech_embeds = speech_embeds.view(bsz, seqlen // 2, ndim * 2)
                 audio_embeds = torch.cat([audio_embeds, speech_embeds], dim=-1)
                 audio_embeds = self.ln_audio(audio_embeds)
+                raw_audio_embeds_len = torch.ceil(fbank_feature_len / 640).to(torch.int64)
             elif self.encoder_type == "whisper_beats":
                 with torch.set_grad_enabled(not freeze_encoder):
                     speech_embeds = self.speech_encoder(fbank_feature, return_dict=True).last_hidden_state
@@ -760,10 +800,22 @@ class SALMONN(PreTrainedModel):
                 audio_embeds = self.ln_audio(audio_embeds)
                 speech_embeds = self.ln_speech(speech_embeds)
                 audio_embeds = torch.cat([audio_embeds, speech_embeds], dim=-1)
+                raw_audio_embeds_len = torch.full(
+                    (audio_embeds.size(0),),
+                    audio_embeds.size(1),
+                    dtype=torch.int64,
+                    device=audio_embeds.device,
+                )
             elif self.encoder_type == "whisper":
                 with torch.set_grad_enabled(not freeze_encoder):
                     speech_embeds = self.audio_encoder(fbank_feature, return_dict=True).last_hidden_state
                 audio_embeds = self.ln_audio(speech_embeds)
+                raw_audio_embeds_len = torch.full(
+                    (audio_embeds.size(0),),
+                    audio_embeds.size(1),
+                    dtype=torch.int64,
+                    device=audio_embeds.device,
+                )
             elif self.encoder_type == "qwenomni" or self.encoder_type == "qwen3omni":
                 fbank_feature = fbank_feature.permute(0, 2, 1)[raw_wavs.bool()].permute(1, 0)
                 with torch.set_grad_enabled(not freeze_encoder):
@@ -782,21 +834,25 @@ class SALMONN(PreTrainedModel):
                         )
                 audio_embeds = rnn.pad_sequence(torch.split(audio_outputs.last_hidden_state, audio_output_lengths.tolist(), dim=0),batch_first=True)            
                 audio_embeds = self.ln_audio(audio_embeds)
+                raw_audio_embeds_len = audio_output_lengths.to(torch.int64)
             elif self.encoder_type == "mimo":
                 with torch.set_grad_enabled(not freeze_encoder):
                     audio_embeds, _, encoder_output_length, _ = self.audio_encoder.encode(fbank_feature, fbank_feature_len, use_quantizer=False)
                 audio_embeds = self.ln_audio(audio_embeds)
+                raw_audio_embeds_len = encoder_output_length.to(torch.int64)
             elif self.encoder_type == "perception_av":
                 with torch.inference_mode():
                     encoder_outputs = self.audio_encoder(fbank_feature.unsqueeze(1), padding_mask=raw_wavs, input_features=None)
                 audio_embeds = encoder_outputs.last_hidden_state
                 encoder_output_length = encoder_outputs.audio_feature_padding_mask.sum(dim=-1)
                 audio_embeds = self.ln_audio(audio_embeds)
+                raw_audio_embeds_len = encoder_output_length.to(torch.int64)
             elif self.encoder_type == "audio_flamingo":
                 with torch.set_grad_enabled(not freeze_encoder):
                     encoder_outputs = self.audio_encoder(fbank_feature, input_features_mask=raw_wavs)
                 audio_embeds = encoder_outputs.last_hidden_state
                 audio_embeds = self.ln_audio(audio_embeds)
+                raw_audio_embeds_len = torch.ceil(fbank_feature_len / 4).to(torch.int64)
 
             if self.connector_type == "Qformer":
                 assert self.encoder_type == "zipformer2"
@@ -807,6 +863,8 @@ class SALMONN(PreTrainedModel):
             
             # this is for MLP connnector
             elif self.connector_type == "MLP":
+                if not use_mlp_connector:
+                    return audio_embeds, raw_audio_embeds_len
                 bsz, seqlen, ndim = audio_embeds.size()
                 if seqlen % self.connector_seg_size != 0:
                     pad_embeds = torch.zeros(
