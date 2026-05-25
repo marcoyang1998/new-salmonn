@@ -69,6 +69,7 @@ class DataArguments:
         metadata={"help": "Maximum audio duration in seconds. Entries with any audio longer than this are "
                           "removed. -1 (default) disables filtering."},
     )
+    skip_thinking_token_loss: bool = field(default=False)
 
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):

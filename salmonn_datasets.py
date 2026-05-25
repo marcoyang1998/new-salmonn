@@ -36,6 +36,7 @@ class SALMONN_Dataset(Dataset):
         self.audio_chunk = audio_chunk * 16000 # TODO: make this optional
         self.split_audio = args.split_audio
         self.shuffle_mc_options = bool(getattr(args, "shuffle_mc_options", True))
+        self.skip_thinking_token_loss = bool(getattr(args, "skip_thinking_token_loss", False))
 
         self.data = json.load(open(args.data_path, "r"))["data"]
 
@@ -221,9 +222,13 @@ class SALMONN_Dataset(Dataset):
         if not biasing_list:
             return chats
 
-        shuffled_biasing_list = [str(word) for word in biasing_list]
-        random.shuffle(shuffled_biasing_list)
-        biasing_text = f"[{', '.join(shuffled_biasing_list)}]"
+        biasing_words = [str(word) for word in biasing_list]
+        if len(biasing_words) > 10:
+            sample_size = random.randint(10, min(20, len(biasing_words)))
+            biasing_words = random.sample(biasing_words, sample_size)
+        else:
+            random.shuffle(biasing_words)
+        biasing_text = f"[{', '.join(biasing_words)}]"
         if not biasing_text:
             return chats
 
@@ -385,6 +390,8 @@ class SALMONN_Dataset(Dataset):
             im_end_id = 151645
             assistant_id = 77091
             shift_num = 3
+            if self.skip_thinking_token_loss:
+                shift_num = 3 + 4
         elif self.llm_type == "Llama":
             im_start_id = 128006
             im_end_id = 128009
