@@ -37,6 +37,13 @@ class SALMONN_Dataset(Dataset):
         self.split_audio = args.split_audio
         self.shuffle_mc_options = bool(getattr(args, "shuffle_mc_options", True))
         self.skip_thinking_token_loss = bool(getattr(args, "skip_thinking_token_loss", False))
+        self.ctx_biasing_list_min_ratio = float(getattr(args, "ctx_biasing_list_min_ratio", 0.5))
+        self.ctx_biasing_list_max_ratio = float(getattr(args, "ctx_biasing_list_max_ratio", 1.0))
+        if not 0 < self.ctx_biasing_list_min_ratio <= self.ctx_biasing_list_max_ratio <= 1:
+            raise ValueError(
+                "ctx_biasing_list_min_ratio and ctx_biasing_list_max_ratio must satisfy "
+                f"0 < min <= max <= 1, but got {self.ctx_biasing_list_min_ratio} and {self.ctx_biasing_list_max_ratio}."
+            )
 
         self.data = json.load(open(args.data_path, "r"))["data"]
 
@@ -214,6 +221,29 @@ class SALMONN_Dataset(Dataset):
     def _get_user_prompt(self, chats: List[Dict]) -> str:
         return chats[0]["content"].replace("<audio>", " ").strip()
 
+    def _get_valid_think_paths(self, sample: Dict) -> List[str]:
+        think_paths = sample.get("think_paths", [])
+        if not isinstance(think_paths, list):
+            return []
+        return [
+            path.strip()
+            for path in think_paths
+            if isinstance(path, str) and path.strip()
+        ]
+
+    def _sample_think_path(self, sample: Dict) -> str:
+        think_paths = self._get_valid_think_paths(sample)
+        return random.choice(think_paths) if think_paths else ""
+
+    def _has_reasoning_content(self, chats: List[Dict]) -> bool:
+        return any(
+            isinstance(chat, dict)
+            and chat.get("role") == "assistant"
+            and isinstance(chat.get("reasoning_content"), str)
+            and chat["reasoning_content"].strip()
+            for chat in chats
+        )
+
     def _build_contextual_asr_messages(self, sample: Dict) -> List[Dict]:
         chats = copy.deepcopy(sample["messages"])
         biasing_list = sample.get("biasing_list", [])
@@ -222,12 +252,14 @@ class SALMONN_Dataset(Dataset):
         if not biasing_list:
             return chats
 
+        think_path = self._sample_think_path(sample)
         biasing_words = [str(word) for word in biasing_list]
-        if len(biasing_words) > 10:
-            sample_size = random.randint(10, min(20, len(biasing_words)))
-            biasing_words = random.sample(biasing_words, sample_size)
-        else:
-            random.shuffle(biasing_words)
+        if not think_path:
+            if len(biasing_words) > 10:
+                sample_size = random.randint(10, min(20, len(biasing_words)))
+                biasing_words = random.sample(biasing_words, sample_size)
+            else:
+                random.shuffle(biasing_words)
         biasing_text = f"[{', '.join(biasing_words)}]"
         if not biasing_text:
             return chats
@@ -245,17 +277,101 @@ class SALMONN_Dataset(Dataset):
             "</biasing_list>."
         )
         chats[0]["content"] = user_content
+        if (
+            think_path
+            and len(chats) > 1
+            and isinstance(chats[1], dict)
+            and chats[1].get("role") == "assistant"
+        ):
+            chats[1]["reasoning_content"] = think_path
         return chats
+
+    def _build_multimodal_contextual_asr_messages(self, sample: Dict) -> List[Dict]:
+        chats = copy.deepcopy(sample["messages"])
+        biasing_list = sample.get("biasing_list", [])
+        ctx_audios = sample.get("ctx_audios", [])
+        if not chats or not isinstance(chats[0], dict):
+            return chats
+        if not isinstance(biasing_list, list) or not isinstance(ctx_audios, list):
+            raise ValueError("Multimodal contextual ASR requires list fields: biasing_list and ctx_audios.")
+        if len(biasing_list) != len(ctx_audios):
+            raise ValueError(
+                "Multimodal contextual ASR requires one ctx_audio per biasing word, "
+                f"but got {len(ctx_audios)} ctx_audios and {len(biasing_list)} biasing words."
+            )
+        if not biasing_list:
+            return chats
+
+        user_content = chats[0].get("content", "").rstrip()
+        if user_content and user_content[-1] not in ".!?:":
+            user_content += "."
+        if user_content:
+            user_content += "\n"
+        lines = [
+            user_content + "Use the following contextual words and their pronunciations as references while transcribing the speech:",
+            "<biasing_list>",
+        ]
+        for word in biasing_list:
+            lines.append(f"<audio>{word}")
+        lines.append("</biasing_list>.")
+        chats[0]["content"] = "\n".join(lines)
+        return chats
+
+    def _sample_multimodal_contextual_asr_biasing(self, sample: Dict) -> Dict:
+        if sample.get("task_type") != "contextual_ASR" or "ctx_audios" not in sample:
+            return sample
+        if sample.get("_ctx_audios_sampled", False):
+            return sample
+        biasing_list = sample.get("biasing_list", [])
+        ctx_audios = sample.get("ctx_audios", [])
+        if not isinstance(biasing_list, list) or not isinstance(ctx_audios, list):
+            raise ValueError("Multimodal contextual ASR requires list fields: biasing_list and ctx_audios.")
+        if len(biasing_list) != len(ctx_audios):
+            raise ValueError(
+                "Multimodal contextual ASR requires one ctx_audio per biasing word, "
+                f"but got {len(ctx_audios)} ctx_audios and {len(biasing_list)} biasing words."
+            )
+        if len(biasing_list) <= 1:
+            return sample
+
+        min_len = max(1, math.ceil(len(biasing_list) * self.ctx_biasing_list_min_ratio))
+        max_len = max(min_len, math.floor(len(biasing_list) * self.ctx_biasing_list_max_ratio))
+        sample_size = random.randint(min_len, max_len)
+        sampled_pairs = random.sample(list(zip(biasing_list, ctx_audios)), sample_size)
+
+        sampled_sample = copy.deepcopy(sample)
+        sampled_sample["biasing_list"] = [word for word, _ in sampled_pairs]
+        sampled_sample["ctx_audios"] = [ctx_audio for _, ctx_audio in sampled_pairs]
+        sampled_sample["_ctx_audios_sampled"] = True
+        return sampled_sample
+
+    def _get_sample_audio_paths(self, sample: Dict) -> List[str]:
+        audio_paths = list(sample["audios"])
+        if sample.get("task_type") == "contextual_ASR" and "ctx_audios" in sample:
+            ctx_audios = sample.get("ctx_audios", [])
+            if not isinstance(ctx_audios, list):
+                raise ValueError("ctx_audios must be a list when present.")
+            audio_paths.extend(ctx_audios)
+        return audio_paths
+
+    def _get_grouped_sample_audio_paths(self, sample: Dict):
+        main_audio_paths = list(sample["audios"])
+        ctx_audio_paths = []
+        if sample.get("task_type") == "contextual_ASR" and "ctx_audios" in sample:
+            ctx_audio_paths = sample.get("ctx_audios", [])
+            if not isinstance(ctx_audio_paths, list):
+                raise ValueError("ctx_audios must be a list when present.")
+        return [(audio_path, 0) for audio_path in main_audio_paths] + [(audio_path, 1) for audio_path in ctx_audio_paths]
     
     def __getitem__(self, index):
         for attempt in range(self.broken_sample_max_retries):
             sample_index = index if attempt == 0 else random.randint(0, len(self.data) - 1)
-            sample = self.data[sample_index]
+            sample = self._sample_multimodal_contextual_asr_biasing(self.data[sample_index])
             try:
                 result = self._load_sample(sample)
                 return result
             except Exception as e:
-                for audio_path in sample.get("audios", []):
+                for audio_path in self._get_sample_audio_paths(sample):
                     if audio_path not in self._broken_audio_paths:
                         print(f"[WARN] Broken audio detected and skipped: {audio_path}; error={repr(e)}", flush=True)
                         self._broken_audio_paths.add(audio_path)
@@ -267,9 +383,16 @@ class SALMONN_Dataset(Dataset):
         fbanks = []
         fbank_lens = []
         raw_wavs = []
+        ctx_fbanks = []
+        ctx_fbank_lens = []
+        ctx_raw_wavs = []
         audio_nums = []
+        audio_feature_groups = []
         audio_files = []
-        for audio_path in sample["audios"]:
+        for audio_path, audio_group in self._get_grouped_sample_audio_paths(sample):
+            target_fbanks = fbanks if audio_group == 0 else ctx_fbanks
+            target_fbank_lens = fbank_lens if audio_group == 0 else ctx_fbank_lens
+            target_raw_wavs = raw_wavs if audio_group == 0 else ctx_raw_wavs
             audio, fs = self._load_audio(audio_path)
             duration = audio.shape[1] / fs
             if duration < self.min_audio_duration:
@@ -299,86 +422,114 @@ class SALMONN_Dataset(Dataset):
                     if item_fbanks.ndim == 2:
                         item_fbanks = item_fbanks.unsqueeze(0)
                     audio_nums.append(item_fbanks.size(0))
+                    audio_feature_groups.extend([audio_group] * item_fbanks.size(0))
                     for item_fbank in item_fbanks:
-                        fbanks.append(item_fbank)
-                        fbank_lens.append(fbanks[-1].size(0))
-                    fbank_lens[-1] = max(math.ceil((self.audio_chunk - pad_len) / 160),50)
+                        target_fbanks.append(item_fbank)
+                        target_fbank_lens.append(target_fbanks[-1].size(0))
+                    target_fbank_lens[-1] = max(math.ceil((self.audio_chunk - pad_len) / 160),50)
                 else:
-                    fbanks.append(self.fbank.extract(audio.squeeze(), sampling_rate=fs))
-                    fbank_lens.append(fbanks[-1].size(0))
+                    audio_nums.append(1)
+                    audio_feature_groups.append(audio_group)
+                    target_fbanks.append(self.fbank.extract(audio.squeeze(), sampling_rate=fs))
+                    target_fbank_lens.append(target_fbanks[-1].size(0))
             elif self.encoder_type == "dasheng":
+                audio_nums.append(1)
+                audio_feature_groups.append(audio_group)
                 if audio.size(0) > 1:
                     audio = audio.mean(dim=0, keepdim=True)
-                fbanks.append(self.fbank(audio, sampling_rate=fs, return_tensors="pt").input_values.squeeze(0).transpose(0, 1))
-                fbank_lens.append(fbanks[-1].size(0))
+                target_fbanks.append(self.fbank(audio, sampling_rate=fs, return_tensors="pt").input_values.squeeze(0).transpose(0, 1))
+                target_fbank_lens.append(target_fbanks[-1].size(0))
             elif self.encoder_type == "dasheng_wavlm":
+                audio_nums.append(1)
+                audio_feature_groups.append(audio_group)
                 if audio.size(0) > 1:
                     audio = audio.mean(dim=0, keepdim=True)
-                fbanks.append(audio.squeeze())
-                fbank_lens.append(fbanks[-1].size(0))
+                target_fbanks.append(audio.squeeze())
+                target_fbank_lens.append(target_fbanks[-1].size(0))
             elif self.encoder_type == "whisper_beats":
+                audio_nums.append(1)
+                audio_feature_groups.append(audio_group)
                 if audio.size(0) > 1:
                     audio = audio.mean(dim=0, keepdim=True)
-                raw_wavs.append(audio.squeeze())
+                target_raw_wavs.append(audio.squeeze())
                 sf_audio, _ = sf.read(audio_path, frames=self.max_frames)
                 if len(sf_audio.shape) == 2: # stereo to mono
                     sf_audio = sf_audio[:, 0]
-                fbanks.append(self.fbank(sf_audio, sampling_rate=fs, return_tensors="pt")["input_features"].squeeze())
-                fbank_lens.append(raw_wavs[-1].size(0))
+                target_fbanks.append(self.fbank(sf_audio, sampling_rate=fs, return_tensors="pt")["input_features"].squeeze())
+                target_fbank_lens.append(target_raw_wavs[-1].size(0))
             elif self.encoder_type == "whisper":
+                audio_nums.append(1)
+                audio_feature_groups.append(audio_group)
                 sf_audio, _ = sf.read(audio_path, frames=self.max_frames)
                 if len(sf_audio.shape) == 2: # stereo to mono
                     sf_audio = sf_audio[:, 0]
-                fbanks.append(self.fbank(sf_audio, sampling_rate=fs, return_tensors="pt")["input_features"].squeeze())
-                fbank_lens.append(1500)
+                target_fbanks.append(self.fbank(sf_audio, sampling_rate=fs, return_tensors="pt")["input_features"].squeeze())
+                target_fbank_lens.append(1500)
             elif self.encoder_type == "qwenomni" or self.encoder_type == "qwen3omni":
+                audio_nums.append(1)
+                audio_feature_groups.append(audio_group)
                 sf_audio, _ = sf.read(audio_path, frames=self.max_frames)
                 if len(sf_audio.shape) == 2: # stereo to mono
                     sf_audio = sf_audio[:, 0]
                 one_fbank = self.fbank(sf_audio, sampling_rate=fs, return_tensors="pt", return_attention_mask=True)
-                fbanks.append(one_fbank["input_features"].squeeze())
-                raw_wavs.append(one_fbank["attention_mask"].squeeze())
-                fbank_lens.append(one_fbank["attention_mask"].sum(-1))
+                target_fbanks.append(one_fbank["input_features"].squeeze())
+                target_raw_wavs.append(one_fbank["attention_mask"].squeeze())
+                target_fbank_lens.append(one_fbank["attention_mask"].sum(-1))
             elif self.encoder_type == "mimo":
+                audio_nums.append(1)
+                audio_feature_groups.append(audio_group)
                 if audio.ndim == 2:
                     audio = audio.mean(dim=0)
                 audio = torchaudio.functional.resample(audio, fs, 24000)
                 spec = self.fbank(audio[None, :])
                 mel = torch.log(torch.clip(spec, min=1e-7)).squeeze().transpose(0, 1)
-                fbanks.append(mel)
-                fbank_lens.append(mel.size(0))
+                target_fbanks.append(mel)
+                target_fbank_lens.append(mel.size(0))
             elif self.encoder_type == "perception_av":
+                audio_nums.append(1)
+                audio_feature_groups.append(audio_group)
                 inputs = self.fbank(videos=None, audio=[audio_path], text=None)
-                fbanks.append(inputs['input_values'].squeeze())
-                raw_wavs.append(inputs['padding_mask'].squeeze())
-                fbank_lens.append(inputs['padding_mask'].sum(-1))
+                target_fbanks.append(inputs['input_values'].squeeze())
+                target_raw_wavs.append(inputs['padding_mask'].squeeze())
+                target_fbank_lens.append(inputs['padding_mask'].sum(-1))
             elif self.encoder_type == "audio_flamingo":
+                audio_nums.append(1)
+                audio_feature_groups.append(audio_group)
                 sf_audio, _ = sf.read(audio_path, frames=self.max_frames)
                 if len(sf_audio.shape) == 2: # stereo to mono
                     sf_audio = sf_audio[:, 0]
                 inputs = self.fbank(sf_audio, sampling_rate=fs, return_tensors="pt", return_attention_mask=True)
-                fbanks.append(inputs["input_features"].squeeze())
-                raw_wavs.append(inputs["attention_mask"].squeeze())
-                fbank_lens.append(inputs["attention_mask"].sum(-1))
+                target_fbanks.append(inputs["input_features"].squeeze())
+                target_raw_wavs.append(inputs["attention_mask"].squeeze())
+                target_fbank_lens.append(inputs["attention_mask"].sum(-1))
         
         if sample.get("task_type") == "qa_mc" and "mc_options" in sample and "mc_question" in sample:
             chats = self._build_mc_messages(sample)
+        elif sample.get("task_type") == "contextual_ASR" and "ctx_audios" in sample:
+            chats = self._build_multimodal_contextual_asr_messages(sample)
         elif sample.get("task_type") == "contextual_ASR":
             chats = self._build_contextual_asr_messages(sample)
         else:
             chats = sample["messages"]
+        has_reasoning_content = self._has_reasoning_content(chats)
         
         self._verify_chat(chats)
+        audio_placeholder_count = chats[0]["content"].count("<audio>")
+        if audio_placeholder_count != len(audio_nums):
+            raise ValueError(
+                f"Audio placeholder count ({audio_placeholder_count}) does not match loaded audio count "
+                f"({len(audio_nums)}): {audio_files}"
+            )
+        if len(audio_feature_groups) != sum(audio_nums):
+            raise ValueError(
+                f"Audio feature group count ({len(audio_feature_groups)}) does not match expanded audio count "
+                f"({sum(audio_nums)}): {audio_files}"
+            )
         text = self.tokenizer.apply_chat_template(chats,tokenize=False)
         if self.llm_type == "Qwen":
-            if self.split_audio and len(audio_nums) > 0:
-                for audio_num in audio_nums:
-                    text = text.replace("<audio>","<|vision_start|>"*audio_num+"<|vision_end|>",1)
-                model_inputs = self.tokenizer(text, return_tensors="pt")
-            else:
-                model_inputs = self.tokenizer(
-                    text.replace("<audio>","<|vision_start|><|vision_end|>"), return_tensors="pt"
-                )
+            for audio_num in audio_nums:
+                text = text.replace("<audio>","<|vision_start|>"*audio_num+"<|vision_end|>",1)
+            model_inputs = self.tokenizer(text, return_tensors="pt")
         elif self.llm_type == "Llama":
             model_inputs = self.tokenizer(text.replace("<audio>","<|reserved_special_token_0|><|reserved_special_token_1|>"), return_tensors="pt", add_special_tokens=False)
         input_ids = model_inputs["input_ids"][0]
@@ -390,7 +541,7 @@ class SALMONN_Dataset(Dataset):
             im_end_id = 151645
             assistant_id = 77091
             shift_num = 3
-            if self.skip_thinking_token_loss:
+            if self.skip_thinking_token_loss and not has_reasoning_content:
                 shift_num = 3 + 4
         elif self.llm_type == "Llama":
             im_start_id = 128006
@@ -410,6 +561,10 @@ class SALMONN_Dataset(Dataset):
         new_sample["fbank_feature"] = fbanks
         new_sample["fbank_feature_len"] = fbank_lens
         new_sample["raw_wavs"] = raw_wavs
+        new_sample["ctx_fbank_feature"] = ctx_fbanks
+        new_sample["ctx_fbank_feature_len"] = ctx_fbank_lens
+        new_sample["ctx_raw_wavs"] = ctx_raw_wavs
+        new_sample["audio_feature_groups"] = audio_feature_groups
         new_sample["user_prompt"] = [self._get_user_prompt(chats)]
         new_sample["audio_files"] = audio_files
 
