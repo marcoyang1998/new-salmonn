@@ -1214,7 +1214,7 @@ class SALMONN(PreTrainedModel):
                 )
                 audio_num += 1
                 bos_idx += audio_len
-                padding_idx += audio_len
+                # padding_idx += audio_len
                 current_audio_embed_list.append(current_audio_embed)
             current_attention_mask = torch.ones((len(current_input_embeds),), dtype=torch.long).to(current_input_embeds.device)
             current_attention_mask[padding_idx] = 0
@@ -1277,7 +1277,20 @@ class SALMONN(PreTrainedModel):
         )
         return input_embeds, attention_mask, None
 
-    def prepare_inputs_labels_for_speech(self, input_ids, attention_mask, labels, fbank_feature, fbank_feature_len, raw_wavs, user_prompts=None):
+    def prepare_inputs_labels_for_speech(
+        self,
+        input_ids,
+        attention_mask,
+        labels,
+        fbank_feature,
+        fbank_feature_len,
+        raw_wavs,
+        user_prompts=None,
+        ctx_fbank_feature=None,
+        ctx_fbank_feature_len=None,
+        ctx_raw_wavs=None,
+        audio_feature_groups=None,
+    ):
         if self.llm_type == "Qwen":
             bos_id = 151652
             padding_id = 151643
@@ -1292,12 +1305,37 @@ class SALMONN(PreTrainedModel):
                 audio_embeds, audio_embeds_lens
             )
 
+        has_ctx_audio = ctx_fbank_feature is not None and ctx_fbank_feature_len is not None
+        ctx_audio_embeds = None
+        ctx_audio_embeds_lens = None
+        if has_ctx_audio:
+            ctx_audio_embeds, ctx_audio_embeds_lens = self.encode_audio(
+                ctx_fbank_feature,
+                ctx_fbank_feature_len,
+                ctx_raw_wavs,
+            )
+            if self.inject_temporal_embedding:
+                ctx_audio_embeds, ctx_audio_embeds_lens = self.inject_temporal_embeddings(
+                    ctx_audio_embeds,
+                    ctx_audio_embeds_lens,
+                )
+            elif self.inject_temporal_embedding_nl:
+                ctx_audio_embeds, ctx_audio_embeds_lens = self.inject_temporal_embeddings_with_natural_language(
+                    ctx_audio_embeds,
+                    ctx_audio_embeds_lens,
+                )
+            if audio_feature_groups is None:
+                raise ValueError("audio_feature_groups must be provided when ctx audio features are provided.")
+            audio_feature_groups = audio_feature_groups.to(input_ids.device)
+
         external_user_prompt_embeds = None
         if self.use_reasoning_network and self.num_pause_steps > 0 and self.use_qwen3_embedding_model:
             external_user_prompt_embeds = self._get_external_user_prompt_embeds(
                 user_prompts, input_ids.device
             )
         if self.use_reasoning_network and self.num_pause_steps > 0:
+            if has_ctx_audio:
+                raise NotImplementedError("Reasoning network with separate ctx audio features is not implemented.")
             return self.prepare_inputs_labels_for_speech_with_reasoning(
                 input_ids,
                 labels,
@@ -1313,6 +1351,8 @@ class SALMONN(PreTrainedModel):
         input_embeds_list = []
         attention_mask_list = []
         audio_num = 0
+        main_audio_num = 0
+        ctx_audio_num = 0
         if labels is not None:
             labels_list = []
             for i in range(bsz):
@@ -1324,8 +1364,21 @@ class SALMONN(PreTrainedModel):
                 # find where currect_input_ids == bos_id, return all the index, this will be used for injecting audio embedding
                 bos_idx = (input_ids[i] == bos_id).nonzero(as_tuple=True)[0]
                 for idx in bos_idx:
-                    audio_len = min(audio_embeds_lens[audio_num], seqlen)
-                    current_audio_embed = audio_embeds[audio_num, :audio_len, :]
+                    if has_ctx_audio:
+                        audio_group = int(audio_feature_groups[audio_num].item())
+                        if audio_group == 0: # main audio
+                            audio_len = min(audio_embeds_lens[main_audio_num], audio_embeds.size(1))
+                            current_audio_embed = audio_embeds[main_audio_num, :audio_len, :]
+                            main_audio_num += 1
+                        elif audio_group == 1: # context audio
+                            audio_len = min(ctx_audio_embeds_lens[ctx_audio_num], ctx_audio_embeds.size(1))
+                            current_audio_embed = ctx_audio_embeds[ctx_audio_num, :audio_len, :]
+                            ctx_audio_num += 1
+                        else:
+                            raise ValueError(f"Unknown audio feature group: {audio_group}")
+                    else:
+                        audio_len = min(audio_embeds_lens[audio_num], seqlen)
+                        current_audio_embed = audio_embeds[audio_num, :audio_len, :]
                     current_input_embeds = torch.cat(
                         (current_input_embeds[:idx + 1], current_audio_embed, current_input_embeds[idx + 1:]),
                         dim=0,
@@ -1375,6 +1428,17 @@ class SALMONN(PreTrainedModel):
             input_embeds = rnn.pad_sequence(input_embeds_list, batch_first=True)
             attention_mask = rnn.pad_sequence(attention_mask_list, batch_first=True, padding_value=0)
             labels = rnn.pad_sequence(labels_list, batch_first=True, padding_value=-100)
+            if has_ctx_audio and (
+                audio_num != audio_feature_groups.numel()
+                or main_audio_num != audio_embeds.size(0)
+                or ctx_audio_num != ctx_audio_embeds.size(0)
+            ):
+                raise ValueError(
+                    "Audio feature consumption mismatch: "
+                    f"bos={audio_num}/{audio_feature_groups.numel()}, "
+                    f"main={main_audio_num}/{audio_embeds.size(0)}, "
+                    f"ctx={ctx_audio_num}/{ctx_audio_embeds.size(0)}"
+                )
             return input_embeds, attention_mask, labels
 
         for i in range(bsz):
@@ -1386,15 +1450,28 @@ class SALMONN(PreTrainedModel):
             bos_idx = (input_ids[i] == bos_id).nonzero(as_tuple=True)[0]
             padding_idx = (input_ids[i] == padding_id).nonzero(as_tuple=True)[0]
             for idx in bos_idx:
-                audio_len = min(audio_embeds_lens[audio_num], seqlen)
-                current_audio_embed = audio_embeds[audio_num, :audio_len, :]
+                if has_ctx_audio:
+                    audio_group = int(audio_feature_groups[audio_num].item())
+                    if audio_group == 0:
+                        audio_len = min(audio_embeds_lens[main_audio_num], audio_embeds.size(1))
+                        current_audio_embed = audio_embeds[main_audio_num, :audio_len, :]
+                        main_audio_num += 1
+                    elif audio_group == 1:
+                        audio_len = min(ctx_audio_embeds_lens[ctx_audio_num], ctx_audio_embeds.size(1))
+                        current_audio_embed = ctx_audio_embeds[ctx_audio_num, :audio_len, :]
+                        ctx_audio_num += 1
+                    else:
+                        raise ValueError(f"Unknown audio feature group: {audio_group}")
+                else:
+                    audio_len = min(audio_embeds_lens[audio_num], seqlen)
+                    current_audio_embed = audio_embeds[audio_num, :audio_len, :]
                 current_input_embeds = torch.cat(
                     (current_input_embeds[:idx + 1], current_audio_embed, current_input_embeds[idx + 1:]),
                     dim=0,
                 )
                 audio_num += 1
                 bos_idx += audio_len
-                padding_idx += audio_len
+                # padding_idx += audio_len
             current_attention_mask = torch.ones((len(current_input_embeds),), dtype=torch.long).to(current_input_embeds.device)
             current_attention_mask[padding_idx] = 0
             if self.num_pause_steps > 0:
@@ -1412,6 +1489,17 @@ class SALMONN(PreTrainedModel):
         attention_mask = rnn.pad_sequence(
             attention_mask_list, batch_first=True, padding_value=0, padding_side="left"
         )
+        if has_ctx_audio and (
+            audio_num != audio_feature_groups.numel()
+            or main_audio_num != audio_embeds.size(0)
+            or ctx_audio_num != ctx_audio_embeds.size(0)
+        ):
+            raise ValueError(
+                "Audio feature consumption mismatch: "
+                f"bos={audio_num}/{audio_feature_groups.numel()}, "
+                f"main={main_audio_num}/{audio_embeds.size(0)}, "
+                f"ctx={ctx_audio_num}/{ctx_audio_embeds.size(0)}"
+            )
         return input_embeds, attention_mask, None
     
     def maybe_autocast(self, dtype=torch.bfloat16):
@@ -1439,6 +1527,10 @@ class SALMONN(PreTrainedModel):
         fbank_feature = None,
         fbank_feature_len = None,
         raw_wavs = None,
+        ctx_fbank_feature = None,
+        ctx_fbank_feature_len = None,
+        ctx_raw_wavs = None,
+        audio_feature_groups = None,
         audio_files = None,
         user_prompts = None,
     ) -> Union[Tuple, CausalLMOutputWithPast]:
@@ -1451,7 +1543,17 @@ class SALMONN(PreTrainedModel):
         # print(f"Current rank: {int(os.environ.get('RANK', 0))}, fbank_feature_len: {fbank_feature_len}")
         try:
             input_embeds, attention_mask, labels = self.prepare_inputs_labels_for_speech(
-                input_ids, attention_mask, labels, fbank_feature, fbank_feature_len, raw_wavs, user_prompts,
+                input_ids,
+                attention_mask,
+                labels,
+                fbank_feature,
+                fbank_feature_len,
+                raw_wavs,
+                user_prompts,
+                ctx_fbank_feature=ctx_fbank_feature,
+                ctx_fbank_feature_len=ctx_fbank_feature_len,
+                ctx_raw_wavs=ctx_raw_wavs,
+                audio_feature_groups=audio_feature_groups,
             )
         except:
             print(f"Error in prepare_inputs_labels_for_speech, the audio files are: {audio_files}")
