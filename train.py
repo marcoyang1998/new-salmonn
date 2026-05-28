@@ -69,6 +69,8 @@ class DataArguments:
         metadata={"help": "Maximum audio duration in seconds. Entries with any audio longer than this are "
                           "removed. -1 (default) disables filtering."},
     )
+    ctx_biasing_list_min_ratio: float = field(default=0.5, metadata={"help": "Minimum sampled ratio of ctx-audio biasing entries for contextual ASR."})
+    ctx_biasing_list_max_ratio: float = field(default=1.0, metadata={"help": "Maximum sampled ratio of ctx-audio biasing entries for contextual ASR."})
     skip_thinking_token_loss: bool = field(default=False)
 
 @dataclass
@@ -245,14 +247,35 @@ def main():
             fbank_feature = []
             fbank_feature_len = []
             raw_wav = []
+            ctx_fbank_feature = []
+            ctx_fbank_feature_len = []
+            ctx_raw_wav = []
+            audio_feature_groups = []
             for s in samples:
                 fbank_feature += s["fbank_feature"]
                 fbank_feature_len += s["fbank_feature_len"]
                 raw_wav += s["raw_wavs"]
+                ctx_fbank_feature += s.get("ctx_fbank_feature", [])
+                ctx_fbank_feature_len += s.get("ctx_fbank_feature_len", [])
+                ctx_raw_wav += s.get("ctx_raw_wavs", [])
+                audio_feature_groups += s.get("audio_feature_groups", [0] * len(s["fbank_feature"]))
             fbank_feature = pad_sequence(fbank_feature, batch_first=True)
             if raw_wav != []:
                 raw_wav = pad_sequence(raw_wav, batch_first=True)
             fbank_feature_len = torch.tensor(fbank_feature_len)
+            if ctx_fbank_feature != []:
+                ctx_fbank_feature = pad_sequence(ctx_fbank_feature, batch_first=True)
+            else:
+                ctx_fbank_feature = None
+            if ctx_raw_wav != []:
+                ctx_raw_wav = pad_sequence(ctx_raw_wav, batch_first=True)
+            else:
+                ctx_raw_wav = []
+            if ctx_fbank_feature_len != []:
+                ctx_fbank_feature_len = torch.tensor(ctx_fbank_feature_len)
+            else:
+                ctx_fbank_feature_len = None
+            audio_feature_groups = torch.tensor(audio_feature_groups, dtype=torch.long)
 
             return {
                 "input_ids": input_ids,
@@ -261,6 +284,10 @@ def main():
                 "fbank_feature": fbank_feature,
                 "fbank_feature_len": fbank_feature_len,
                 "raw_wavs": raw_wav,
+                "ctx_fbank_feature": ctx_fbank_feature,
+                "ctx_fbank_feature_len": ctx_fbank_feature_len,
+                "ctx_raw_wavs": ctx_raw_wav,
+                "audio_feature_groups": audio_feature_groups,
                 "audio_files": [s["audio_files"] for s in samples],
                 "user_prompts": [s["user_prompt"][0] for s in samples],
             }
