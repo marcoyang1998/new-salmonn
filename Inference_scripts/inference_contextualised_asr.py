@@ -28,12 +28,15 @@ def parse_args():
 
     parser.add_argument("--use_beam_search", type=str2bool, default=False)
     parser.add_argument("--beam_size", type=int, default=4)
+    parser.add_argument("--length_penalty", type=float, default=1.0)
     parser.add_argument("--use_nucleus_sampling", type=str2bool, default=False)
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top_p", type=float, default=0.8)
     parser.add_argument("--top_k", type=int, default=20)
     parser.add_argument("--min_p", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--use_oracle_biasing_list", type=str2bool, default=False)
+    parser.add_argument("--use_ctx_audio", type=str2bool, default=True)
     return parser.parse_args()
 
 
@@ -56,10 +59,13 @@ if __name__ == "__main__":
         tokenizer_path=args.tokenizer_path,
         use_beam_search=args.use_beam_search,
         beam_size=args.beam_size,
+        length_penalty=args.length_penalty,
         use_nucleus_sampling=args.use_nucleus_sampling,
         temperature=args.temperature,
         top_p=args.top_p,
         top_k=args.top_k,
         min_p=args.min_p,
         seed=args.seed,
+        use_oracle_biasing_list=args.use_oracle_biasing_list,
+        use_ctx_audio=args.use_ctx_audio,
     )

@@ -43,12 +43,15 @@ def main(
     tokenizer_path: str = None,
     use_beam_search: bool = False,
     beam_size: int = 4,
+    length_penalty: float = 1.0,
     use_nucleus_sampling: bool = False,
     temperature: float = 0.7,
     top_p: float = 0.8,
     top_k: int = 20,
     min_p: float = 0.0,
     seed: int = 42,
+    use_oracle_biasing_list: bool = False,
+    use_ctx_audio: bool = True,
 ):
     inference_manager = InferenceManager(
         checkpoint_path=checkpoint_path,
@@ -59,12 +62,15 @@ def main(
         tokenizer_path=tokenizer_path,
         use_beam_search=use_beam_search,
         beam_size=beam_size,
+        length_penalty=length_penalty,
         use_nucleus_sampling=use_nucleus_sampling,
         temperature=temperature,
         top_p=top_p,
         top_k=top_k,
         min_p=min_p,
         seed=seed,
+        use_oracle_biasing_list=use_oracle_biasing_list,
+        use_ctx_audio=use_ctx_audio,
     )
 
     with open(test_set_path, "r") as f:
@@ -130,12 +136,15 @@ if __name__ == "__main__":
     # Decoding related
     parser.add_argument("--use_beam_search", type=str2bool, default=False, help="If True, use beam search; otherwise greedy decoding")
     parser.add_argument("--beam_size", type=int, default=4, help="Beam size used when --use_beam_search is True")
+    parser.add_argument("--length_penalty", type=float, default=1.0, help="Length penalty used when --use_beam_search is True")
     parser.add_argument("--use_nucleus_sampling", type=str2bool, default=False, help="If True, use nucleus (top-p) sampling")
     parser.add_argument("--temperature", type=float, default=0.7, help="Sampling temperature (used with --use_nucleus_sampling)")
     parser.add_argument("--top_p", type=float, default=0.8, help="Top-p value for nucleus sampling")
     parser.add_argument("--top_k", type=int, default=20, help="Top-k value for nucleus sampling")
     parser.add_argument("--min_p", type=float, default=0.0, help="Min-p value for nucleus sampling")
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility in nucleus sampling")
+    parser.add_argument("--use_oracle_biasing_list", type=str2bool, default=False, help="If True, use ground_truth_biasing_list instead of biasing_list for contextualised ASR prompts")
+    parser.add_argument("--use_ctx_audio", type=str2bool, default=True, help="If True, use ctx_audios for speech-text contextualised ASR when present")
 
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
@@ -164,10 +173,13 @@ if __name__ == "__main__":
         tokenizer_path=args.tokenizer_path,
         use_beam_search=args.use_beam_search,
         beam_size=args.beam_size,
+        length_penalty=args.length_penalty,
         use_nucleus_sampling=args.use_nucleus_sampling,
         temperature=args.temperature,
         top_p=args.top_p,
         top_k=args.top_k,
         min_p=args.min_p,
         seed=args.seed,
+        use_oracle_biasing_list=args.use_oracle_biasing_list,
+        use_ctx_audio=args.use_ctx_audio,
     )

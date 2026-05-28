@@ -83,6 +83,8 @@ OVERRIDE_KEYS = [
     "reasoning_network_num_layers",
     "reasoning_network_dim",
     "lora",
+    "lora_rank",
+    "lora_alpha"
     "dora",
     "encoder_type",
     "encoder_lora",
@@ -125,11 +127,32 @@ def _apply_model_args_overrides(model_args, **kwargs):
 audio_chunk = 30 * 16000
 max_frames = 120 * 16000
 
-def get_prompt(sample: dict) -> str:
+def get_prompt(sample: dict, use_oracle_biasing_list: bool = False, use_ctx_audio: bool = True) -> str:
     task = sample["task"]
 
     if task == "contextualised_asr":
-        bias_words = sample.get("biasing_list", [])
+        if use_oracle_biasing_list:
+            bias_words = sample.get("ground_truth_biasing_list", [])
+        else:
+            bias_words = sample.get("biasing_list", [])
+        ctx_audios = sample.get("ctx_audios", [])
+        if use_ctx_audio and ctx_audios:
+            if not isinstance(bias_words, list) or not isinstance(ctx_audios, list):
+                raise ValueError("Multimodal contextualised ASR requires list fields: biasing_list and ctx_audios.")
+            if len(bias_words) != len(ctx_audios):
+                raise ValueError(
+                    "Multimodal contextualised ASR requires one ctx_audio per biasing word, "
+                    f"but got {len(ctx_audios)} ctx_audios and {len(bias_words)} biasing words."
+                )
+            lines = [
+                "Recognize the speech and give me the transcription.",
+                "Use the following contextual words and their pronunciations as references while transcribing the speech:",
+                "<biasing_list>",
+            ]
+            for word in bias_words:
+                lines.append(f"<audio>{word}")
+            lines.append("</biasing_list>.")
+            return "\n".join(lines)
         if isinstance(bias_words, list):
             bias_words_text = f"[{', '.join(str(w) for w in bias_words)}]"
         else:
@@ -186,11 +209,22 @@ def get_MC_template(sample: dict) -> str:
     options_text = " ".join([f"{chr(65+i)}. {option}" for i, option in enumerate(options)])
     return f"{question} {options_text}"
 
-def get_audio_path_list(sample: dict) -> list[str]:
+def get_audio_path_list(sample: dict, use_ctx_audio: bool = True) -> list[str]:
     audio_path_list = [sample["path"]]
     if "expand_wav" in sample.keys():
         audio_path_list += sample["expand_wav"]  # for some reason expand_wav is a list!
+    if use_ctx_audio and "ctx_audios" in sample:
+        ctx_audios = sample.get("ctx_audios", [])
+        if not isinstance(ctx_audios, list):
+            raise ValueError("ctx_audios must be a list when present.")
+        audio_path_list += ctx_audios
     return audio_path_list
+
+def get_prefix_audio_num(sample: dict) -> int:
+    audio_num = 1
+    if "expand_wav" in sample.keys():
+        audio_num += len(sample["expand_wav"])
+    return audio_num
 
 def extract_audio_features(audio_paths: list[str], fbank: Fbank, model, model_args, split_audio: bool = False):
     features = []

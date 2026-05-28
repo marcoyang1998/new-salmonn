@@ -7,7 +7,7 @@ from lhotse import Fbank, FbankConfig
 import os
 import json
 from tqdm import tqdm
-from inference_utils import get_prompt, get_audio_path_list, extract_audio_features, get_fbank, maybe_init_qwen3_embedding_model, prepare_model_inputs, get_model_args, OVERRIDE_KEYS, override_args_from_config
+from inference_utils import get_prompt, get_audio_path_list, get_prefix_audio_num, extract_audio_features, get_fbank, maybe_init_qwen3_embedding_model, prepare_model_inputs, get_model_args, OVERRIDE_KEYS, override_args_from_config
 import logging
 
 TOKENIZER_PATH="/mnt/shared-storage-gpfs2/brainllm2-share/xiaoyu/models/Qwen3-8B"
@@ -25,12 +25,15 @@ class InferenceManager:
         tokenizer_path: str = TOKENIZER_PATH,
         use_beam_search: bool = False,
         beam_size: int = 4,
+        length_penalty: float = 1.0,
         use_nucleus_sampling: bool = False,
         temperature: float = 0.7,
         top_p: float = 0.8,
         top_k: int = 20,
         min_p: float = 0.0,
         seed: int = 42,
+        use_oracle_biasing_list: bool = False,
+        use_ctx_audio: bool = True,
     ):
         self.model_args = get_model_args(checkpoint_path)
         self.model_args = override_args_from_config(checkpoint_path, self.model_args)
@@ -40,12 +43,15 @@ class InferenceManager:
         self.split_audio = split_audio
         self.use_beam_search = use_beam_search
         self.beam_size = beam_size
+        self.length_penalty = length_penalty
         self.use_nucleus_sampling = use_nucleus_sampling
         self.temperature = temperature
         self.top_p = top_p
         self.top_k = top_k
         self.min_p = min_p
         self.seed = seed
+        self.use_oracle_biasing_list = use_oracle_biasing_list
+        self.use_ctx_audio = use_ctx_audio
         # TODO: check if using checkpoint_path is safe
         self.tokenizer = AutoTokenizer.from_pretrained(checkpoint_path)
         self.fbank = get_fbank(self.model_args)
@@ -78,10 +84,10 @@ class InferenceManager:
         user_prompts = []
         audio_paths = []
         for sample in batch_data:
-            prompt = get_prompt(sample)
+            prompt = get_prompt(sample, use_oracle_biasing_list=self.use_oracle_biasing_list, use_ctx_audio=self.use_ctx_audio)
             user_prompts.append(prompt)
-            audio_path_list = get_audio_path_list(sample)
-            audio_num = len(audio_path_list)
+            audio_path_list = get_audio_path_list(sample, use_ctx_audio=self.use_ctx_audio)
+            audio_num = get_prefix_audio_num(sample)
             audio_paths.extend(audio_path_list)
             messages = [{"role": "user", "content": "<audio>" * audio_num + prompt}]
             text = self.tokenizer.apply_chat_template(
@@ -96,6 +102,7 @@ class InferenceManager:
         if self.use_beam_search:
             generation_config = {
                 "num_beams": self.beam_size,
+                "length_penalty": self.length_penalty,
                 "early_stopping": True,
                 "do_sample": False,
             }
