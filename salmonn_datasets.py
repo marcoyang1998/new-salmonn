@@ -357,6 +357,38 @@ class SALMONN_Dataset(Dataset):
             chats[1]["reasoning_content"] = think_path
         return chats
 
+    def _build_speaker_adaptation_asr_messages(self, sample: Dict) -> List[Dict]:
+        chats = copy.deepcopy(sample["messages"])
+        ctx_audios_texts = sample.get("ctx_audios_texts", [])
+        if not ctx_audios_texts:
+            raise ValueError("ASR_speaker_adaptation requires ctx_audios_texts to be non-empty.")
+        ctx_text = ctx_audios_texts[0]
+        adaptation_tag = sample.get("adaptation_tag", "speaker")
+        if adaptation_tag == "accent":
+            reference_description = (
+                "To help you better understand the speaker's accent, "
+                "I have provided a reference audio clip from a speaker with a similar accent "
+                "along with its correct text:"
+            )
+        else:  # "speaker"
+            reference_description = (
+                "To help you better understand the speaker's specific accent and acoustic features, "
+                "I have provided a reference audio clip from the same speaker along with its correct text:"
+            )
+        user_content = chats[0].get("content", "").rstrip()
+        if user_content and user_content[-1] not in ".!?:":
+            user_content += "."
+        user_content += (
+            f" {reference_description}\n"
+            "\n"
+            "<speaker_reference>\n"
+            "Reference Audio: <audio>\n"
+            f"Reference Text: {ctx_text}\n"
+            "</speaker_reference>"
+        )
+        chats[0]["content"] = user_content
+        return chats
+
     def _sample_multimodal_contextual_asr_biasing(self, sample: Dict) -> Dict:
         if sample.get("task_type") != "contextual_ASR" or "ctx_audios" not in sample:
             return sample
@@ -403,12 +435,21 @@ class SALMONN_Dataset(Dataset):
             if not isinstance(ctx_audios, list):
                 raise ValueError("ctx_audios must be a list when present.")
             audio_paths.extend(ctx_audios)
+        elif sample.get("task_type") == "ASR_speaker_adaptation" and "ctx_audios" in sample:
+            ctx_audios = sample.get("ctx_audios", [])
+            if not isinstance(ctx_audios, list):
+                raise ValueError("ctx_audios must be a list when present.")
+            audio_paths.extend(ctx_audios)
         return audio_paths
 
     def _get_grouped_sample_audio_paths(self, sample: Dict):
         main_audio_paths = list(sample["audios"])
         ctx_audio_paths = []
         if sample.get("task_type") == "contextual_ASR" and "ctx_audios" in sample:
+            ctx_audio_paths = sample.get("ctx_audios", [])
+            if not isinstance(ctx_audio_paths, list):
+                raise ValueError("ctx_audios must be a list when present.")
+        elif sample.get("task_type") == "ASR_speaker_adaptation" and "ctx_audios" in sample:
             ctx_audio_paths = sample.get("ctx_audios", [])
             if not isinstance(ctx_audio_paths, list):
                 raise ValueError("ctx_audios must be a list when present.")
@@ -560,6 +601,8 @@ class SALMONN_Dataset(Dataset):
             chats = self._build_multimodal_contextual_asr_messages(sample)
         elif sample.get("task_type") == "contextual_ASR":
             chats = self._build_contextual_asr_messages(sample)
+        elif sample.get("task_type") == "ASR_speaker_adaptation" and sample.get("adaptation_tag") in ("speaker", "accent"):
+            chats = self._build_speaker_adaptation_asr_messages(sample)
         else:
             chats = sample["messages"]
         has_reasoning_content = self._has_reasoning_content(chats)
