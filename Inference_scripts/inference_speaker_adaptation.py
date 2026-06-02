@@ -27,6 +27,19 @@ def parse_args():
         choices=["speaker_adaptation", "accent_adaptation"],
         help="Which adaptation task to run inference for.",
     )
+    parser.add_argument(
+        "--prompt_task",
+        type=str,
+        default=None,
+        choices=["speaker_adaptation", "accent_adaptation", "asr"],
+        help="Override the prompt task. Use 'asr' to run plain ASR on adaptation JSON.",
+    )
+    parser.add_argument(
+        "--use_ctx_audio",
+        type=str2bool,
+        default=True,
+        help="Whether to feed ctx_audios when the prompt uses them.",
+    )
 
     parser.add_argument("--use_beam_search", type=str2bool, default=False)
     parser.add_argument("--beam_size", type=int, default=4)
@@ -42,9 +55,11 @@ def parse_args():
 
 if __name__ == "__main__":
     args = parse_args()
-    write_path_title = args.write_path_title or f"stage2_{args.model_id}_{args.task}"
+    prompt_task = args.prompt_task or args.task
+    write_path_title = args.write_path_title or f"stage2_{args.model_id}_{args.task}_{prompt_task}"
     write_path = Path(args.results_folder) / f"{write_path_title}.jsonl"
     write_path.parent.mkdir(parents=True, exist_ok=True)
+    use_ctx_audio = args.use_ctx_audio and prompt_task != "asr"
 
     main(
         args.test_set_path,
@@ -66,5 +81,6 @@ if __name__ == "__main__":
         top_k=args.top_k,
         min_p=args.min_p,
         seed=args.seed,
-        use_ctx_audio=True,
+        use_ctx_audio=use_ctx_audio,
+        prompt_task_override=prompt_task,
     )

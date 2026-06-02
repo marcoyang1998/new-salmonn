@@ -52,6 +52,7 @@ def main(
     seed: int = 42,
     use_oracle_biasing_list: bool = False,
     use_ctx_audio: bool = True,
+    prompt_task_override: str = None,
 ):
     inference_manager = InferenceManager(
         checkpoint_path=checkpoint_path,
@@ -71,6 +72,7 @@ def main(
         seed=seed,
         use_oracle_biasing_list=use_oracle_biasing_list,
         use_ctx_audio=use_ctx_audio,
+        prompt_task_override=prompt_task_override,
     )
 
     with open(test_set_path, "r") as f:
@@ -145,6 +147,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility in nucleus sampling")
     parser.add_argument("--use_oracle_biasing_list", type=str2bool, default=False, help="If True, use ground_truth_biasing_list instead of biasing_list for contextualised ASR prompts")
     parser.add_argument("--use_ctx_audio", type=str2bool, default=True, help="If True, use ctx_audios for speech-text contextualised ASR when present")
+    parser.add_argument("--prompt_task_override", type=str, default=None, help="Override the task used for prompt construction without changing task filtering")
 
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
@@ -182,4 +185,5 @@ if __name__ == "__main__":
         seed=args.seed,
         use_oracle_biasing_list=args.use_oracle_biasing_list,
         use_ctx_audio=args.use_ctx_audio,
+        prompt_task_override=args.prompt_task_override,
     )

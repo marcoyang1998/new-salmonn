@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field, asdict
+from typing import Optional
 from modeling_salmonn import SALMONN
 from transformers import AutoConfig, AutoTokenizer
 import torch
@@ -34,6 +35,7 @@ class InferenceManager:
         seed: int = 42,
         use_oracle_biasing_list: bool = False,
         use_ctx_audio: bool = True,
+        prompt_task_override: Optional[str] = None,
     ):
         self.model_args = get_model_args(checkpoint_path)
         self.model_args = override_args_from_config(checkpoint_path, self.model_args)
@@ -52,6 +54,7 @@ class InferenceManager:
         self.seed = seed
         self.use_oracle_biasing_list = use_oracle_biasing_list
         self.use_ctx_audio = use_ctx_audio
+        self.prompt_task_override = prompt_task_override
         # TODO: check if using checkpoint_path is safe
         self.tokenizer = AutoTokenizer.from_pretrained(checkpoint_path)
         self.fbank = get_fbank(self.model_args)
@@ -84,10 +87,13 @@ class InferenceManager:
         user_prompts = []
         audio_paths = []
         for sample in batch_data:
-            prompt = get_prompt(sample, use_oracle_biasing_list=self.use_oracle_biasing_list, use_ctx_audio=self.use_ctx_audio)
+            prompt_sample = sample
+            if self.prompt_task_override is not None:
+                prompt_sample = {**sample, "task": self.prompt_task_override}
+            prompt = get_prompt(prompt_sample, use_oracle_biasing_list=self.use_oracle_biasing_list, use_ctx_audio=self.use_ctx_audio)
             user_prompts.append(prompt)
-            audio_path_list = get_audio_path_list(sample, use_ctx_audio=self.use_ctx_audio)
-            audio_num = get_prefix_audio_num(sample)
+            audio_path_list = get_audio_path_list(prompt_sample, use_ctx_audio=self.use_ctx_audio)
+            audio_num = get_prefix_audio_num(prompt_sample)
             audio_paths.extend(audio_path_list)
             messages = [{"role": "user", "content": "<audio>" * audio_num + prompt}]
             text = self.tokenizer.apply_chat_template(
