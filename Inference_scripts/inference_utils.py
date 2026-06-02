@@ -130,6 +130,35 @@ max_frames = 120 * 16000
 def get_prompt(sample: dict, use_oracle_biasing_list: bool = False, use_ctx_audio: bool = True) -> str:
     task = sample["task"]
 
+    if task == "speaker_adaptation":
+        ctx_audios_texts = sample.get("ctx_audios_texts", [])
+        ctx_text = ctx_audios_texts[0] if ctx_audios_texts else ""
+        return (
+            "Recognize the speech and give me the transcription."
+            " To help you better understand the speaker's specific accent and acoustic features,"
+            " I have provided a reference audio clip from the same speaker along with its correct text:\n"
+            "\n"
+            "<speaker_reference>\n"
+            "Reference Audio: <audio>\n"
+            f"Reference Text: {ctx_text}\n"
+            "</speaker_reference>"
+        )
+
+    if task == "accent_adaptation":
+        ctx_audios_texts = sample.get("ctx_audios_texts", [])
+        ctx_text = ctx_audios_texts[0] if ctx_audios_texts else ""
+        return (
+            "Recognize the speech and give me the transcription."
+            " To help you better understand the speaker's accent,"
+            " I have provided a reference audio clip from a speaker with a similar accent"
+            " along with its correct text:\n"
+            "\n"
+            "<speaker_reference>\n"
+            "Reference Audio: <audio>\n"
+            f"Reference Text: {ctx_text}\n"
+            "</speaker_reference>"
+        )
+
     if task == "contextualised_asr":
         if use_oracle_biasing_list:
             bias_words = sample.get("ground_truth_biasing_list", [])
