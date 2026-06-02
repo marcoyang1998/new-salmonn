@@ -40,6 +40,7 @@ class SALMONN_Dataset(Dataset):
         self.ctx_biasing_list_min_ratio = float(getattr(args, "ctx_biasing_list_min_ratio", 0.5))
         self.ctx_biasing_list_max_ratio = float(getattr(args, "ctx_biasing_list_max_ratio", 1.0))
         self.oracle_biasing_word_drop_prob = float(getattr(args, "oracle_biasing_word_drop_prob", 0.0))
+        self.p_drop_speaker_adaptation = float(getattr(args, "p_drop_speaker_adaptation", 0.0))
         if not 0 < self.ctx_biasing_list_min_ratio <= self.ctx_biasing_list_max_ratio <= 1:
             raise ValueError(
                 "ctx_biasing_list_min_ratio and ctx_biasing_list_max_ratio must satisfy "
@@ -49,6 +50,11 @@ class SALMONN_Dataset(Dataset):
             raise ValueError(
                 "oracle_biasing_word_drop_prob must satisfy 0 <= p_drop <= 1, "
                 f"but got {self.oracle_biasing_word_drop_prob}."
+            )
+        if not 0 <= self.p_drop_speaker_adaptation <= 1:
+            raise ValueError(
+                "p_drop_speaker_adaptation must satisfy 0 <= p <= 1, "
+                f"but got {self.p_drop_speaker_adaptation}."
             )
 
         self.data = json.load(open(args.data_path, "r"))["data"]
@@ -389,6 +395,18 @@ class SALMONN_Dataset(Dataset):
         chats[0]["content"] = user_content
         return chats
 
+    def _maybe_drop_speaker_adaptation(self, sample: Dict) -> Dict:
+        if sample.get("task_type") != "ASR_speaker_adaptation":
+            return sample
+        if self.p_drop_speaker_adaptation <= 0.0:
+            return sample
+        if random.random() < self.p_drop_speaker_adaptation:
+            sample = {**sample, "task_type": "ASR"}
+            sample.pop("ctx_audios", None)
+            sample.pop("ctx_audios_texts", None)
+            sample.pop("ctx_audios_durations", None)
+        return sample
+
     def _sample_multimodal_contextual_asr_biasing(self, sample: Dict) -> Dict:
         if sample.get("task_type") != "contextual_ASR" or "ctx_audios" not in sample:
             return sample
@@ -458,7 +476,8 @@ class SALMONN_Dataset(Dataset):
     def __getitem__(self, index):
         for attempt in range(self.broken_sample_max_retries):
             sample_index = index if attempt == 0 else random.randint(0, len(self.data) - 1)
-            sample = self._sample_multimodal_contextual_asr_biasing(self.data[sample_index])
+            sample = self._maybe_drop_speaker_adaptation(self.data[sample_index])
+            sample = self._sample_multimodal_contextual_asr_biasing(sample)
             try:
                 result = self._load_sample(sample)
                 return result
