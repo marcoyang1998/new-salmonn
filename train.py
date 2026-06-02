@@ -71,6 +71,7 @@ class DataArguments:
     )
     ctx_biasing_list_min_ratio: float = field(default=0.5, metadata={"help": "Minimum sampled ratio of ctx-audio biasing entries for contextual ASR."})
     ctx_biasing_list_max_ratio: float = field(default=1.0, metadata={"help": "Maximum sampled ratio of ctx-audio biasing entries for contextual ASR."})
+    oracle_biasing_word_drop_prob: float = field(default=0.0, metadata={"help": "Probability of dropping each ground-truth biasing word when contextual ASR is sampled without CoT."})
     skip_thinking_token_loss: bool = field(default=False)
 
 @dataclass
