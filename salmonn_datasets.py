@@ -39,10 +39,16 @@ class SALMONN_Dataset(Dataset):
         self.skip_thinking_token_loss = bool(getattr(args, "skip_thinking_token_loss", False))
         self.ctx_biasing_list_min_ratio = float(getattr(args, "ctx_biasing_list_min_ratio", 0.5))
         self.ctx_biasing_list_max_ratio = float(getattr(args, "ctx_biasing_list_max_ratio", 1.0))
+        self.oracle_biasing_word_drop_prob = float(getattr(args, "oracle_biasing_word_drop_prob", 0.0))
         if not 0 < self.ctx_biasing_list_min_ratio <= self.ctx_biasing_list_max_ratio <= 1:
             raise ValueError(
                 "ctx_biasing_list_min_ratio and ctx_biasing_list_max_ratio must satisfy "
                 f"0 < min <= max <= 1, but got {self.ctx_biasing_list_min_ratio} and {self.ctx_biasing_list_max_ratio}."
+            )
+        if not 0 <= self.oracle_biasing_word_drop_prob <= 1:
+            raise ValueError(
+                "oracle_biasing_word_drop_prob must satisfy 0 <= p_drop <= 1, "
+                f"but got {self.oracle_biasing_word_drop_prob}."
             )
 
         self.data = json.load(open(args.data_path, "r"))["data"]
@@ -235,6 +241,9 @@ class SALMONN_Dataset(Dataset):
         think_paths = self._get_valid_think_paths(sample)
         return random.choice(think_paths) if think_paths else ""
 
+    def _has_think_path(self, sample: Dict) -> bool:
+        return bool(self._get_valid_think_paths(sample))
+
     def _has_reasoning_content(self, chats: List[Dict]) -> bool:
         return any(
             isinstance(chat, dict)
@@ -243,6 +252,23 @@ class SALMONN_Dataset(Dataset):
             and chat["reasoning_content"].strip()
             for chat in chats
         )
+
+    def _get_oracle_biasing_words(self, sample: Dict) -> set:
+        oracle_words = sample.get("ground_truth_biasing_list", [])
+        if not isinstance(oracle_words, list):
+            return set()
+        return {str(word) for word in oracle_words}
+
+    def _sample_biasing_words(self, biasing_words: List[str], oracle_words: set, distractor_sample_size: int) -> List[str]:
+        oracle_biasing_words = [
+            word for word in biasing_words
+            if word in oracle_words and random.random() > self.oracle_biasing_word_drop_prob
+        ]
+        distractor_words = [word for word in biasing_words if word not in oracle_words]
+        distractor_sample_size = min(len(distractor_words), distractor_sample_size)
+        sampled_words = oracle_biasing_words + random.sample(distractor_words, distractor_sample_size)
+        random.shuffle(sampled_words)
+        return sampled_words
 
     def _build_contextual_asr_messages(self, sample: Dict) -> List[Dict]:
         chats = copy.deepcopy(sample["messages"])
@@ -256,8 +282,14 @@ class SALMONN_Dataset(Dataset):
         biasing_words = [str(word) for word in biasing_list]
         if not think_path:
             if len(biasing_words) > 10:
-                sample_size = random.randint(10, min(20, len(biasing_words)))
-                biasing_words = random.sample(biasing_words, sample_size)
+                min_distractor_count = max(0, math.ceil(len(biasing_words) * self.ctx_biasing_list_min_ratio))
+                max_distractor_count = max(min_distractor_count, math.floor(len(biasing_words) * self.ctx_biasing_list_max_ratio))
+                distractor_sample_size = random.randint(min_distractor_count, max_distractor_count)
+                biasing_words = self._sample_biasing_words(
+                    biasing_words,
+                    self._get_oracle_biasing_words(sample),
+                    distractor_sample_size,
+                )
             else:
                 random.shuffle(biasing_words)
         biasing_text = f"[{', '.join(biasing_words)}]"
@@ -302,6 +334,7 @@ class SALMONN_Dataset(Dataset):
         if not biasing_list:
             return chats
 
+        think_path = self._sample_think_path(sample)
         user_content = chats[0].get("content", "").rstrip()
         if user_content and user_content[-1] not in ".!?:":
             user_content += "."
@@ -315,12 +348,21 @@ class SALMONN_Dataset(Dataset):
             lines.append(f"<audio>{word}")
         lines.append("</biasing_list>.")
         chats[0]["content"] = "\n".join(lines)
+        if (
+            think_path
+            and len(chats) > 1
+            and isinstance(chats[1], dict)
+            and chats[1].get("role") == "assistant"
+        ):
+            chats[1]["reasoning_content"] = think_path
         return chats
 
     def _sample_multimodal_contextual_asr_biasing(self, sample: Dict) -> Dict:
         if sample.get("task_type") != "contextual_ASR" or "ctx_audios" not in sample:
             return sample
         if sample.get("_ctx_audios_sampled", False):
+            return sample
+        if self._has_think_path(sample):
             return sample
         biasing_list = sample.get("biasing_list", [])
         ctx_audios = sample.get("ctx_audios", [])
@@ -334,10 +376,19 @@ class SALMONN_Dataset(Dataset):
         if len(biasing_list) <= 1:
             return sample
 
-        min_len = max(1, math.ceil(len(biasing_list) * self.ctx_biasing_list_min_ratio))
-        max_len = max(min_len, math.floor(len(biasing_list) * self.ctx_biasing_list_max_ratio))
-        sample_size = random.randint(min_len, max_len)
-        sampled_pairs = random.sample(list(zip(biasing_list, ctx_audios)), sample_size)
+        min_distractor_count = max(0, math.ceil(len(biasing_list) * self.ctx_biasing_list_min_ratio))
+        max_distractor_count = max(min_distractor_count, math.floor(len(biasing_list) * self.ctx_biasing_list_max_ratio))
+        distractor_sample_size = random.randint(min_distractor_count, max_distractor_count)
+        oracle_words = self._get_oracle_biasing_words(sample)
+        oracle_pairs = [
+            (word, ctx_audio)
+            for word, ctx_audio in zip(biasing_list, ctx_audios)
+            if str(word) in oracle_words and random.random() > self.oracle_biasing_word_drop_prob
+        ]
+        distractor_pairs = [(word, ctx_audio) for word, ctx_audio in zip(biasing_list, ctx_audios) if str(word) not in oracle_words]
+        distractor_sample_size = min(len(distractor_pairs), distractor_sample_size)
+        sampled_pairs = oracle_pairs + random.sample(distractor_pairs, distractor_sample_size)
+        random.shuffle(sampled_pairs)
 
         sampled_sample = copy.deepcopy(sample)
         sampled_sample["biasing_list"] = [word for word, _ in sampled_pairs]
