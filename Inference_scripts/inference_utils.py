@@ -361,6 +361,7 @@ def prepare_model_inputs(texts: list[str], audio_nums: list[int], tokenizer: Aut
                 text_num += 1
                 text = texts[text_num]
             text = text.replace("<audio>","<|vision_start|>"*audio_num+"<|vision_end|>",1)
+        processed_text.append(text)
     else:
         processed_text = [text.replace("<audio>", "<|vision_start|><|vision_end|>") for text in texts]
     return tokenizer(
