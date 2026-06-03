@@ -10,11 +10,34 @@ WORD_PATTERN = re.compile(r"[a-z0-9]+(?:'[a-z0-9]+)*")
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Create a contextual biasing JSON from an original dataset and word counts."
+        description="Create a contextual biasing JSON from an original dataset and biasing words."
+        ,
+        epilog=(
+            "Examples:\n"
+            "  TSV mode (count-filtered vocab):\n"
+            "    python create_contextual_biasing_json.py "
+            "--input_json data.json "
+            "--word_count_tsv word_counts.tsv "
+            "--threshold 27 "
+            "--biasing_list_length 50 "
+            "--output_folder out\n\n"
+            "  TXT mode (one biasing word per line):\n"
+            "    python create_contextual_biasing_json.py "
+            "--input_json data.json "
+            "--bias_words_txt bias_words.txt "
+            "--biasing_list_length 50 "
+            "--output_folder out"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("--input_json", required=True, help="Path to the original JSON file.")
-    parser.add_argument("--word_count_tsv", required=True, help="Path to the word count TSV.")
-    parser.add_argument("--threshold", type=int, required=True, help="Keep words with count <= threshold.")
+    vocab_group = parser.add_mutually_exclusive_group(required=True)
+    vocab_group.add_argument("--word_count_tsv", help="Path to the word count TSV.")
+    vocab_group.add_argument(
+        "--bias_words_txt",
+        help="Path to a TXT file containing one biasing word per line.",
+    )
+    parser.add_argument("--threshold", type=int, help="Keep words with count <= threshold (TSV mode only).")
     parser.add_argument(
         "--biasing_list_length",
         type=int,
@@ -47,6 +70,19 @@ def load_bias_vocab(word_count_tsv: Path, threshold: int) -> list[str]:
             word, count_str = parts
             if int(count_str) <= threshold:
                 bias_vocab.append(word)
+    return bias_vocab
+
+
+def load_bias_vocab_from_txt(bias_words_txt: Path) -> list[str]:
+    bias_vocab = []
+    seen = set()
+    with bias_words_txt.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            word = line.strip()
+            if not word or word in seen:
+                continue
+            seen.add(word)
+            bias_vocab.append(word)
     return bias_vocab
 
 
@@ -113,9 +149,18 @@ def build_biasing_list(
     return biasing_list
 
 
-def build_output_path(input_json: Path, output_folder: Path, threshold: int, biasing_list_length: int) -> Path:
+def build_output_path(
+    input_json: Path,
+    output_folder: Path,
+    threshold: int | None,
+    biasing_list_length: int,
+    vocab_source: str,
+) -> Path:
     stem = input_json.stem
-    output_name = f"{stem}_contextual_ASR_biasing_le{threshold}_top{biasing_list_length}.json"
+    if vocab_source == "word_count_tsv":
+        output_name = f"{stem}_contextual_ASR_biasing_le{threshold}_top{biasing_list_length}.json"
+    else:
+        output_name = f"{stem}_contextual_ASR_biasing_from_txt_top{biasing_list_length}.json"
     return output_folder / output_name
 
 
@@ -123,7 +168,18 @@ def main():
     args = parse_args()
 
     input_json = Path(args.input_json)
-    word_count_tsv = Path(args.word_count_tsv)
+
+    if args.word_count_tsv:
+        if args.threshold is None:
+            raise ValueError("--threshold is required when using --word_count_tsv.")
+        vocab_source = "word_count_tsv"
+        vocab_source_path = Path(args.word_count_tsv)
+    else:
+        if args.threshold is not None:
+            raise ValueError("--threshold is only valid when using --word_count_tsv.")
+        vocab_source = "bias_words_txt"
+        vocab_source_path = Path(args.bias_words_txt)
+
     output_folder = Path(args.output_folder)
     output_folder.mkdir(parents=True, exist_ok=True)
     output_path = build_output_path(
@@ -131,10 +187,14 @@ def main():
         output_folder,
         args.threshold,
         args.biasing_list_length,
+        vocab_source,
     )
 
     rng = random.Random(args.seed)
-    bias_vocab = load_bias_vocab(word_count_tsv, args.threshold)
+    if vocab_source == "word_count_tsv":
+        bias_vocab = load_bias_vocab(vocab_source_path, args.threshold)
+    else:
+        bias_vocab = load_bias_vocab_from_txt(vocab_source_path)
     bias_set = set(bias_vocab)
 
     if len(bias_vocab) < args.biasing_list_length:
@@ -182,7 +242,8 @@ def main():
 
     summary = {
         "input_json": str(input_json),
-        "word_count_tsv": str(word_count_tsv),
+        "vocab_source": vocab_source,
+        "vocab_file": str(vocab_source_path),
         "output_json": str(output_path),
         "threshold": args.threshold,
         "biasing_list_length": args.biasing_list_length,
