@@ -11,7 +11,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Extract SALMONN training items whose selected field matches a regex pattern. "
-            "Input JSON must contain top-level key 'annotation'."
+            "Input JSON must contain top-level key 'data'."
         )
     )
     parser.add_argument(
@@ -53,10 +53,10 @@ def load_json(path: str) -> Dict[str, Any]:
 
     if not isinstance(content, dict):
         raise ValueError(f"{path} must be a JSON object.")
-    if "annotation" not in content:
-        raise ValueError(f"{path} must contain top-level key 'annotation'.")
-    if not isinstance(content["annotation"], list):
-        raise ValueError(f"{path}['annotation'] must be a list.")
+    if "data" not in content:
+        raise ValueError(f"{path} must contain top-level key 'data'.")
+    if not isinstance(content["data"], list):
+        raise ValueError(f"{path}['data'] must be a list.")
 
     return content
 
@@ -102,7 +102,7 @@ def main() -> None:
     regex = re.compile(args.pattern, flags)
 
     dataset = load_json(args.input_json)
-    items: List[Any] = dataset["annotation"]
+    items: List[Any] = dataset["data"]
 
     filtered_items: List[Any] = []
     for item in items:
@@ -110,7 +110,7 @@ def main() -> None:
             filtered_items.append(item)
 
     output_obj = dict(dataset)
-    output_obj["annotation"] = filtered_items
+    output_obj["data"] = filtered_items
 
     save_json(args.output_json, output_obj)
 
