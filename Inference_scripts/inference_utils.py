@@ -132,32 +132,65 @@ def get_prompt(sample: dict, use_oracle_biasing_list: bool = False, use_ctx_audi
 
     if task == "speaker_adaptation":
         ctx_audios_texts = sample.get("ctx_audios_texts", [])
-        ctx_text = ctx_audios_texts[0] if ctx_audios_texts else ""
-        return (
-            "Recognize the speech and give me the transcription."
-            " To help you better understand the speaker's specific accent and acoustic features,"
-            " I have provided a reference audio clip from the same speaker along with its correct text:\n"
-            "\n"
-            "<speaker_reference>\n"
-            "Reference Audio: <audio>\n"
-            f"Reference Text: {ctx_text}\n"
-            "</speaker_reference>"
-        )
+        n_ctx = len(ctx_audios_texts)
+        if n_ctx <= 1:
+            ctx_text = ctx_audios_texts[0] if ctx_audios_texts else ""
+            return (
+                "Recognize the speech and give me the transcription."
+                " To help you better understand the speaker's specific accent and acoustic features,"
+                " I have provided a reference audio clip from the same speaker along with its correct text:\n"
+                "\n"
+                "<speaker_reference>\n"
+                "Reference Audio: <audio>\n"
+                f"Reference Text: {ctx_text}\n"
+                "</speaker_reference>"
+            )
+        else:
+            ref_lines = []
+            for i, ctx_text in enumerate(ctx_audios_texts):
+                ref_lines.append(f"Reference Audio {i + 1}: <audio>")
+                ref_lines.append(f"Reference Text {i + 1}: {ctx_text}")
+            return (
+                "Recognize the speech and give me the transcription."
+                " To help you better understand the speaker's specific accent and acoustic features,"
+                " I have provided reference audio clips from the same speaker along with their correct texts:\n"
+                "\n"
+                "<speaker_reference>\n"
+                + "\n".join(ref_lines) + "\n"
+                "</speaker_reference>"
+            )
 
     if task == "accent_adaptation":
         ctx_audios_texts = sample.get("ctx_audios_texts", [])
-        ctx_text = ctx_audios_texts[0] if ctx_audios_texts else ""
-        return (
-            "Recognize the speech and give me the transcription."
-            " To help you better understand the speaker's accent,"
-            " I have provided a reference audio clip from a speaker with a similar accent"
-            " along with its correct text:\n"
-            "\n"
-            "<speaker_reference>\n"
-            "Reference Audio: <audio>\n"
-            f"Reference Text: {ctx_text}\n"
-            "</speaker_reference>"
-        )
+        n_ctx = len(ctx_audios_texts)
+        if n_ctx <= 1:
+            ctx_text = ctx_audios_texts[0] if ctx_audios_texts else ""
+            return (
+                "Recognize the speech and give me the transcription."
+                " To help you better understand the speaker's accent,"
+                " I have provided a reference audio clip from a speaker with a similar accent"
+                " along with its correct text:\n"
+                "\n"
+                "<speaker_reference>\n"
+                "Reference Audio: <audio>\n"
+                f"Reference Text: {ctx_text}\n"
+                "</speaker_reference>"
+            )
+        else:
+            ref_lines = []
+            for i, ctx_text in enumerate(ctx_audios_texts):
+                ref_lines.append(f"Reference Audio {i + 1}: <audio>")
+                ref_lines.append(f"Reference Text {i + 1}: {ctx_text}")
+            return (
+                "Recognize the speech and give me the transcription."
+                " To help you better understand the speaker's accent,"
+                " I have provided reference audio clips from a speaker with a similar accent"
+                " along with their correct texts:\n"
+                "\n"
+                "<speaker_reference>\n"
+                + "\n".join(ref_lines) + "\n"
+                "</speaker_reference>"
+            )
 
     if task == "contextualised_asr":
         if use_oracle_biasing_list:

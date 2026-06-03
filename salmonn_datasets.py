@@ -368,30 +368,56 @@ class SALMONN_Dataset(Dataset):
         ctx_audios_texts = sample.get("ctx_audios_texts", [])
         if not ctx_audios_texts:
             raise ValueError("ASR_speaker_adaptation requires ctx_audios_texts to be non-empty.")
-        ctx_text = ctx_audios_texts[0]
         adaptation_tag = sample.get("adaptation_tag", "speaker")
+        n_ctx = len(ctx_audios_texts)
         if adaptation_tag == "accent":
-            reference_description = (
-                "To help you better understand the speaker's accent, "
-                "I have provided a reference audio clip from a speaker with a similar accent "
-                "along with its correct text:"
-            )
+            if n_ctx == 1:
+                reference_description = (
+                    "To help you better understand the speaker's accent, "
+                    "I have provided a reference audio clip from a speaker with a similar accent "
+                    "along with its correct text:"
+                )
+            else:
+                reference_description = (
+                    "To help you better understand the speaker's accent, "
+                    "I have provided reference audio clips from a speaker with a similar accent "
+                    "along with their correct texts:"
+                )
         else:  # "speaker"
-            reference_description = (
-                "To help you better understand the speaker's specific accent and acoustic features, "
-                "I have provided a reference audio clip from the same speaker along with its correct text:"
-            )
+            if n_ctx == 1:
+                reference_description = (
+                    "To help you better understand the speaker's specific accent and acoustic features, "
+                    "I have provided a reference audio clip from the same speaker along with its correct text:"
+                )
+            else:
+                reference_description = (
+                    "To help you better understand the speaker's specific accent and acoustic features, "
+                    "I have provided reference audio clips from the same speaker along with their correct texts:"
+                )
         user_content = chats[0].get("content", "").rstrip()
         if user_content and user_content[-1] not in ".!?:":
             user_content += "."
-        user_content += (
-            f" {reference_description}\n"
-            "\n"
-            "<speaker_reference>\n"
-            "Reference Audio: <audio>\n"
-            f"Reference Text: {ctx_text}\n"
-            "</speaker_reference>"
-        )
+        if n_ctx == 1:
+            user_content += (
+                f" {reference_description}\n"
+                "\n"
+                "<speaker_reference>\n"
+                "Reference Audio: <audio>\n"
+                f"Reference Text: {ctx_audios_texts[0]}\n"
+                "</speaker_reference>"
+            )
+        else:
+            ref_lines = []
+            for i, ctx_text in enumerate(ctx_audios_texts):
+                ref_lines.append(f"Reference Audio {i + 1}: <audio>")
+                ref_lines.append(f"Reference Text {i + 1}: {ctx_text}")
+            user_content += (
+                f" {reference_description}\n"
+                "\n"
+                "<speaker_reference>\n"
+                + "\n".join(ref_lines) + "\n"
+                "</speaker_reference>"
+            )
         chats[0]["content"] = user_content
         return chats
 
