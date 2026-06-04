@@ -696,7 +696,8 @@ class SALMONN(PreTrainedModel):
             audio_encoder = PEAudioVisual.from_config(model_args.audio_encoder_path, pretrained=True).audio_visual_model.audio_model
         elif self.encoder_type == "audio_flamingo":
             from transformers import AudioFlamingo3ForConditionalGeneration
-            audio_encoder = AudioFlamingo3ForConditionalGeneration.from_pretrained("/mnt/bn/audio-visual-llm-data6/ckpts/audio-flamingo-3-hf").audio_tower
+            AF3_MODEL_PATH = "/mnt/shared-storage-gpfs2/brainllm2-share/xiaoyu/models/nvidia--audio-flamingo-3-hf"
+            audio_encoder = AudioFlamingo3ForConditionalGeneration.from_pretrained(AF3_MODEL_PATH).audio_tower
 
         return audio_encoder
 
