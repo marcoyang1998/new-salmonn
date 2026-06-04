@@ -203,6 +203,8 @@ def main():
     os.environ["WANDB_PROJECT"] = "salmonn_v1.1"
 
     if training_args.min_learning_rate is not None:
+        if training_args.lr_scheduler_kwargs is None:
+            training_args.lr_scheduler_kwargs = {}
         training_args.lr_scheduler_kwargs["min_lr"] = training_args.min_learning_rate
 
     tokenizer, model, dataset = load_model_and_dataset(model_args, data_args, training_args)
