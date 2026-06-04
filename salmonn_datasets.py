@@ -137,7 +137,8 @@ class SALMONN_Dataset(Dataset):
             from core.audio_visual_encoder import PEAudioVisualTransform
             self.fbank = PEAudioVisualTransform.from_config("/mnt/bn/audio-visual-llm-data6/ckpts/pe-av-large", max_seconds = self.max_frames / 16000)
         elif encoder_type == "audio_flamingo":
-            self.fbank = WhisperFeatureExtractor.from_pretrained("/mnt/bn/audio-visual-llm-data6/ckpts/audio-flamingo-3-hf")
+            AF3_MODEL_PATH = "/mnt/shared-storage-gpfs2/brainllm2-share/xiaoyu/models/nvidia--audio-flamingo-3-hf"
+            self.fbank = WhisperFeatureExtractor.from_pretrained(AF3_MODEL_PATH)
 
         self.client = None
         self._broken_audio_paths = set()
