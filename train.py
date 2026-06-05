@@ -205,7 +205,11 @@ def main():
     if training_args.min_learning_rate is not None:
         if training_args.lr_scheduler_kwargs is None:
             training_args.lr_scheduler_kwargs = {}
-        training_args.lr_scheduler_kwargs["min_lr"] = training_args.min_learning_rate
+        # Pass min_lr_rate (ratio) instead of min_lr (absolute) to avoid
+        # optimizer.defaults["lr"] lookup, which fails with DeepSpeed ZeroOptimizer.
+        training_args.lr_scheduler_kwargs["min_lr_rate"] = (
+            training_args.min_learning_rate / training_args.learning_rate
+        )
 
     tokenizer, model, dataset = load_model_and_dataset(model_args, data_args, training_args)
 
@@ -517,7 +521,7 @@ def main():
         model=model,
         args=training_args,
         train_dataset=dataset,
-        tokenizer=tokenizer, # modified
+        processing_class=tokenizer,
         data_collator=collator,
         callbacks=callbacks,
     )
