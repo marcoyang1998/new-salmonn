@@ -25,21 +25,42 @@ def main(path):
     counts = Counter()
     total = 0
 
+    # Detect format by reading the first non-empty line
     with open(path) as f:
         first_line = f.readline().strip()
-        if first_line.startswith('{"data"'):
-            # JSON format: one item per line
+
+    if first_line in ("{", '{"data": [', '{ "data": ['):
+        # JSON with "data" wrapper — may be compact or pretty-printed
+        # Peek at line after header to distinguish
+        with open(path) as f:
             for line in f:
-                line = line.strip().rstrip(",")
-                if not line or line in ("]}",  "]"):
+                stripped = line.strip()
+                if stripped and stripped not in ("{", '"data": [', '{"data": ['):
+                    second_content = stripped
                     break
-                item = json.loads(line)
+        if second_content.startswith('{'):
+            # Compact: one item per line, skip first header line
+            with open(path) as f:
+                f.readline()
+                for line in f:
+                    line = line.strip().rstrip(",")
+                    if not line or line in ("]}",  "]"):
+                        break
+                    item = json.loads(line)
+                    dur = item["durations"][0] if item.get("durations") else 0
+                    counts[get_bucket(dur)] += 1
+                    total += 1
+        else:
+            # Pretty-printed: load whole file
+            with open(path) as f:
+                data = json.load(f)
+            for item in data["data"]:
                 dur = item["durations"][0] if item.get("durations") else 0
                 counts[get_bucket(dur)] += 1
                 total += 1
-        else:
-            # Pure JSONL
-            f.seek(0)
+    else:
+        # Pure JSONL
+        with open(path) as f:
             for line in f:
                 line = line.strip()
                 if not line:
