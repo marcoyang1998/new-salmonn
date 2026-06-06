@@ -24,6 +24,7 @@ def get_bucket(dur):
 def main(path):
     counts = Counter()
     total = 0
+    total_duration = 0.0
 
     # Detect format by reading the first non-empty line
     with open(path) as f:
@@ -50,6 +51,7 @@ def main(path):
                     dur = item["durations"][0] if item.get("durations") else 0
                     counts[get_bucket(dur)] += 1
                     total += 1
+                    total_duration += dur
         else:
             # Pretty-printed: load whole file
             with open(path) as f:
@@ -58,6 +60,7 @@ def main(path):
                 dur = item["durations"][0] if item.get("durations") else 0
                 counts[get_bucket(dur)] += 1
                 total += 1
+                total_duration += dur
     else:
         # Pure JSONL
         with open(path) as f:
@@ -69,9 +72,11 @@ def main(path):
                 dur = item["durations"][0] if item.get("durations") else 0
                 counts[get_bucket(dur)] += 1
                 total += 1
+                total_duration += dur
 
     print(f"File: {path}")
     print(f"Total items: {total}\n")
+    print(f"Total duration: {total_duration / 3600:.2f} h ({total_duration:.1f} s)\n")
     print(f"{'Bucket':<10} {'Count':>10} {'Percentage':>12}")
     print("-" * 34)
     for label, _, _ in BUCKETS:

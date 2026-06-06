@@ -218,6 +218,12 @@ def print_stats(all_durations):
     print("")
 
 
+def total_duration_seconds(all_durations):
+    return sum(
+        d for durations in all_durations for d in durations if d >= 0
+    )
+
+
 def main():
     args = parse_args()
 
@@ -332,7 +338,8 @@ def main():
     print(f"  Items kept                  : {len(clean_items)}")
 
     # ---- print stats --------------------------------------------------------
-    print_stats([d for d in all_durations_flat if all(v >= 0 for v in d)])
+    valid_duration_lists = [d for d in all_durations_flat if all(v >= 0 for v in d)]
+    print_stats(valid_duration_lists)
 
     # ---- save ---------------------------------------------------------------
     print(f"Saving to {output_path} …", flush=True)
@@ -340,6 +347,11 @@ def main():
     with open(output_path, "w", encoding="utf-8") as f:
         json.dump(dataset, f, ensure_ascii=False, indent=2)
     print(f"  Done in {time.time() - t3:.1f}s")
+    final_total_seconds = total_duration_seconds(valid_duration_lists)
+    print(
+        f"Final total kept audio duration: {final_total_seconds / 3600:.2f} h "
+        f"({final_total_seconds:.1f} s)"
+    )
     print(f"\nTotal wall time: {time.time() - t0:.1f}s")
 
 

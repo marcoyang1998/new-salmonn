@@ -254,6 +254,10 @@ def main():
         torch_dtype="auto",
         device_map="auto",
     )
+    if model_args.inject_temporal_embedding:
+        model.register_temporal_tokens(tokenizer)
+    if getattr(model_args, "inject_temporal_embedding_nl", False):
+        model.register_nl_timestamp_tokenizer(tokenizer)
     maybe_init_qwen3_embedding_model(model, model_args)
     model.eval()
 
