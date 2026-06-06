@@ -30,7 +30,13 @@ def parse_args() -> argparse.Namespace:
         "--field",
         type=str,
         required=True,
-        choices=["audios", "task_type"],
+        choices=[
+            "audios",
+            "task_type",
+            "user_content",
+            "assistant_content",
+            "both_content",
+        ],
         help="Which field to check for a match.",
     )
     parser.add_argument(
@@ -61,12 +67,51 @@ def load_json(path: str) -> Dict[str, Any]:
     return content
 
 
+def get_message_contents(item: Dict[str, Any], roles: List[str]) -> List[str]:
+    messages = item.get("messages")
+    if not isinstance(messages, list):
+        return []
+
+    contents: List[str] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") not in roles:
+            continue
+
+        content = message.get("content")
+        if isinstance(content, str):
+            contents.append(content)
+        elif content is not None:
+            contents.append(str(content))
+
+    return contents
+
+
 def item_matches(item: Dict[str, Any], field: str, regex: re.Pattern[str]) -> bool:
     value = item.get(field)
 
     if field == "task_type":
         if isinstance(value, str):
             return regex.search(value) is not None
+        return False
+
+    if field == "user_content":
+        for content in get_message_contents(item, ["user"]):
+            if regex.search(content) is not None:
+                return True
+        return False
+
+    if field == "assistant_content":
+        for content in get_message_contents(item, ["assistant"]):
+            if regex.search(content) is not None:
+                return True
+        return False
+
+    if field == "both_content":
+        for content in get_message_contents(item, ["user", "assistant"]):
+            if regex.search(content) is not None:
+                return True
         return False
 
     # field == "audios"
