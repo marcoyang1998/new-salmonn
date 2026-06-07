@@ -20,7 +20,8 @@ from inference_utils import ModelArguments, OVERRIDE_KEYS, maybe_init_qwen3_embe
 LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 QUESTION_TEMPLATE = (
-    "Answer the following multiple-choice question using only the correct option.\n"
+    # "Answer the following multiple-choice question using only the correct option.\n"
+    "Listen to the audio and answer the following multiple-choice question."
     "Question: {question}\n"
     "Choices:\n"
     "{choices_str}\n"
@@ -255,6 +256,10 @@ def main():
         torch_dtype="auto",
         device_map="auto",
     )
+    if model_args.inject_temporal_embedding:
+        model.register_temporal_tokens(tokenizer)
+    if getattr(model_args, "inject_temporal_embedding_nl", False):
+        model.register_nl_timestamp_tokenizer(tokenizer)
     maybe_init_qwen3_embedding_model(model, model_args)
     model.eval()
 
@@ -283,7 +288,7 @@ def main():
             messages, 
             tokenize=False,
             add_generation_prompt=True,
-            enable_thinking=True, # TODO: in the training code, the pause embed is injected before <think>
+            enable_thinking=False, # TODO: in the training code, the pause embed is injected before <think>
         )
 
         feature, raw_wavs, audio_nums, split_feature_lens = extract_features(audio_path, fbank, model_args)

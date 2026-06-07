@@ -44,8 +44,12 @@ def convert_commonvoice_english_to_salmonn_json(args):
     all_entries = []
     max_text_len = 0
     longest_text = ""
+    skipped_too_long = 0
     
     for i, cut in tqdm(enumerate(cuts)):
+        if args.max_duration is not None and cut.duration > args.max_duration:
+            skipped_too_long += 1
+            continue
         audio_path = cut.recording.sources[0].source
         audio_path = audio_path.replace(
             "download/common_voice_17_0",
@@ -58,7 +62,7 @@ def convert_commonvoice_english_to_salmonn_json(args):
         if len(text) > max_text_len:
             max_text_len = max(max_text_len, len(text))
             longest_text = text
-        
+        text = text.replace("\"", "")
         prompt = random.sample(asr_prompts, 1)[0]
         prompt = "<audio>" + prompt # add placeholder for audio embeddings
         current_entry = {
@@ -86,6 +90,8 @@ def convert_commonvoice_english_to_salmonn_json(args):
         json.dump({"data": all_entries}, out_file, ensure_ascii=True, indent=2)
         
     print(f"The longest text content length is {longest_text} with {max_text_len} characters.")
+    if args.max_duration is not None:
+        print(f"Skipped {skipped_too_long} entries with duration > {args.max_duration} seconds.")
     print(f"Saved the converted dataset to {args.output_json_path}. Total entries: {len(all_entries)}")
     
 if __name__ == "__main__":
@@ -93,6 +99,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Convert common voice Lhotse manifest to SALMONN json format")
     parser.add_argument("--manifest_path", type=str, required=True, help="Path to the common voice Lhotse manifest (e.g., cuts.jsonl.gz)")
     parser.add_argument("--output_json_path", type=str, required=True, help="Path to save the converted json file")
+    parser.add_argument("--max_duration", type=float, default=None, help="If set, skip entries whose audio duration exceeds this threshold in seconds")
     
     args = parser.parse_args()
     convert_commonvoice_english_to_salmonn_json(args)

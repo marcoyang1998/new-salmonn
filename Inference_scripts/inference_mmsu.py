@@ -27,7 +27,8 @@ QUESTION_PROMPTS = (
 )
 
 QUESTION_TEMPLATE = (
-    "Answer the following multiple-choice question using only the correct option.\n"
+    # "Answer the following multiple-choice question using only the correct option.\n"
+    "Listen to the audio and answer the following multiple-choice question."
     "Question: {question}\n"
     "Choices:\n"
     "{choices_str}\n"
@@ -286,7 +287,7 @@ def main():
                 messages,
                 tokenize=False,
                 add_generation_prompt=True,
-                enable_thinking=True,
+                enable_thinking=False,
             )
 
             feature, raw_wavs, audio_nums, split_feature_lens = extract_features_from_array(
