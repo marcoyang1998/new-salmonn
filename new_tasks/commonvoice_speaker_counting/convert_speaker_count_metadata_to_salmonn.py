@@ -12,12 +12,17 @@ from typing import Any, Dict, List, Sequence
 
 
 DEFAULT_METADATA = Path("salmonn_data_v1.1/speaker_counting/metadata_2to6_maxutt10.json")
-DEFAULT_PROMPT_SOURCE = Path(
-    "salmonn_data_v1.1/speaker_counting/speaker_counting_train_salmonn_10k_2to6_maxutt10.json"
-)
 DEFAULT_OUT = Path(
     "salmonn_data_v1.1/speaker_counting/speaker_counting_train_salmonn_10k_2to6_maxutt10.json"
 )
+SPEAKER_COUNTING_PROMPTS = [
+    "Count the number of speakers in this audio.",
+    "Determine the number of people speaking in this audio clip.",
+    "How many different people are speaking in this audio clip?",
+    "How many distinct speakers are there in this audio?",
+    "How many unique speakers can be heard in this recording?",
+    "How many speakers can you identify in this recording?",
+]
 
 
 def read_json(path: Path) -> Any:
@@ -34,37 +39,6 @@ def unwrap_data(payload: Any, path: Path) -> List[Dict[str, Any]]:
             if isinstance(value, list):
                 return [item for item in value if isinstance(item, dict)]
     raise ValueError(f"Could not find a list of records in {path}")
-
-
-def extract_prompt_from_item(item: Dict[str, Any]) -> str | None:
-    messages = item.get("messages")
-    if not isinstance(messages, list):
-        return None
-    for message in messages:
-        if not isinstance(message, dict) or message.get("role") != "user":
-            continue
-        content = str(message.get("content", "")).strip()
-        if not content:
-            continue
-        return content[len("<audio>") :] if content.startswith("<audio>") else content
-    return None
-
-
-def load_prompts(prompt_source: Path) -> List[str]:
-    payload = read_json(prompt_source)
-    records = unwrap_data(payload, prompt_source)
-
-    prompts: List[str] = []
-    seen = set()
-    for item in records:
-        prompt = extract_prompt_from_item(item)
-        if prompt and prompt not in seen:
-            prompts.append(prompt)
-            seen.add(prompt)
-
-    if not prompts:
-        raise ValueError(f"No user prompts found in {prompt_source}")
-    return prompts
 
 
 def first_present(item: Dict[str, Any], keys: Sequence[str]) -> Any:
@@ -98,14 +72,13 @@ def build_salmonn_item(sample: Dict[str, Any], prompt: str, answer_suffix: str) 
     }
 
 
-def convert(metadata_path: Path, prompt_source: Path, out_path: Path, seed: int, answer_suffix: str) -> None:
+def convert(metadata_path: Path, out_path: Path, seed: int, answer_suffix: str) -> None:
     metadata = read_json(metadata_path)
     samples = unwrap_data(metadata, metadata_path)
-    prompts = load_prompts(prompt_source)
     rng = random.Random(seed)
 
     data = [
-        build_salmonn_item(sample, rng.choice(prompts), answer_suffix)
+        build_salmonn_item(sample, rng.choice(SPEAKER_COUNTING_PROMPTS), answer_suffix)
         for sample in samples
     ]
 
@@ -124,7 +97,6 @@ def convert(metadata_path: Path, prompt_source: Path, out_path: Path, seed: int,
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--metadata", type=Path, default=DEFAULT_METADATA)
-    parser.add_argument("--prompt_source", type=Path, default=DEFAULT_PROMPT_SOURCE)
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -134,7 +106,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    convert(args.metadata, args.prompt_source, args.out, args.seed, args.answer_suffix)
+    convert(args.metadata, args.out, args.seed, args.answer_suffix)
 
 
 if __name__ == "__main__":
