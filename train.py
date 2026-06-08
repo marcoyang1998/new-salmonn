@@ -64,6 +64,10 @@ class DataArguments:
     split_audio: bool = field(default=False)
     audio_chunk: int = field(default=60, metadata={"help": "Audio chunk size in seconds when split_audio is True."})
     shuffle_mc_options: bool = field(default=True)
+    mc_prompt_style: str = field(
+        default="neutral",
+        metadata={"help": "Prompt instruction style for rebuilt qa_mc samples: 'neutral' or 'legacy'."},
+    )
     max_audio_duration: float = field(
         default=-1,
         metadata={"help": "Maximum audio duration in seconds. Entries with any audio longer than this are "

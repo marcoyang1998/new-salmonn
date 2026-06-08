@@ -14,19 +14,25 @@ import torchaudio
 import torch.nn.functional as F
 from transformers import AutoFeatureExtractor
 import soundfile as sf
-from inference_utils import ModelArguments, OVERRIDE_KEYS, maybe_init_qwen3_embedding_model, override_args_from_config
+from inference_utils import (
+    ModelArguments,
+    OVERRIDE_KEYS,
+    add_mc_prompt_style_arg,
+    get_mc_prompt_instruction,
+    maybe_init_qwen3_embedding_model,
+    override_args_from_config,
+)
 
 
 LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 QUESTION_TEMPLATE = (
     # "Answer the following multiple-choice question using only the correct option.\n"
-    "Listen to the audio and answer the following multiple-choice question."
+    "Listen to the audio and answer the following multiple-choice question.\n"
     "Question: {question}\n"
     "Choices:\n"
     "{choices_str}\n"
-    "Please output your final answer with a single letter. "
-    "For example, if you think the answer is Option A, please just output 'A'"
+    "{instruction}"
 )
 
 AF_QUESTION_TEMPLATE = (
@@ -61,10 +67,11 @@ def parse_args():
     parser.add_argument("--concat_encoder_features", type=str2bool, default=None)
     parser.add_argument("--use_af_prompt", type=str2bool, default=False,
                         help="Use 'Choose one among the following options' prompt format")
+    add_mc_prompt_style_arg(parser)
     return parser.parse_args()
 
 
-def build_prompt(question: str, choices: list, use_af_prompt: bool = False) -> str:
+def build_prompt(question: str, choices: list, use_af_prompt: bool = False, mc_prompt_style: str = "neutral") -> str:
     if use_af_prompt:
         choices_lines = "\n".join(
             f"({LETTERS[i]}) {choice}" for i, choice in enumerate(choices)
@@ -73,7 +80,11 @@ def build_prompt(question: str, choices: list, use_af_prompt: bool = False) -> s
     choices_lines = "\n".join(
         f"Option {LETTERS[i]}: {choice}" for i, choice in enumerate(choices)
     )
-    return QUESTION_TEMPLATE.format(question=question, choices_str=choices_lines)
+    return QUESTION_TEMPLATE.format(
+        question=question,
+        choices_str=choices_lines,
+        instruction=get_mc_prompt_instruction(mc_prompt_style),
+    )
 
 
 def get_fbank(model_args):
@@ -274,7 +285,12 @@ def main():
 
     for i, item in enumerate(data):
         choices = item["choices"]
-        prompt = build_prompt(item["question"], choices, use_af_prompt=args.use_af_prompt)
+        prompt = build_prompt(
+            item["question"],
+            choices,
+            use_af_prompt=args.use_af_prompt,
+            mc_prompt_style=args.mc_prompt_style,
+        )
 
         rel = item["audio_path"].lstrip("./")
         audio_path = os.path.join(args.audio_root, rel)

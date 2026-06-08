@@ -15,7 +15,14 @@ import torchaudio
 import torch.nn.functional as F
 from transformers import AutoFeatureExtractor
 import soundfile as sf
-from inference_utils import ModelArguments, OVERRIDE_KEYS, maybe_init_qwen3_embedding_model, override_args_from_config
+from inference_utils import (
+    ModelArguments,
+    OVERRIDE_KEYS,
+    add_mc_prompt_style_arg,
+    get_mc_prompt_instruction,
+    maybe_init_qwen3_embedding_model,
+    override_args_from_config,
+)
 
 
 LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -30,8 +37,7 @@ QUESTION_TEMPLATE = (
     "Question: {question}\n"
     "Choices:\n"
     "{choices_str}\n"
-    "Please output your final answer with a single letter. "
-    "For example, if you think the answer is Option A, please just output 'A'"
+    "{instruction}"
 )
 
 OPEN_TEMPLATE = "Question: {question}\nPlease answer the question based on the audio."
@@ -63,14 +69,19 @@ def parse_args():
     parser.add_argument("--concat_encoder_features", type=str2bool, default=None)
     parser.add_argument("--max_samples", type=int, default=None,
                         help="Limit number of samples (for debugging)")
+    add_mc_prompt_style_arg(parser)
     return parser.parse_args()
 
 
-def build_prompt(question: str, choices: list) -> str:
+def build_prompt(question: str, choices: list, mc_prompt_style: str = "neutral") -> str:
     choices_lines = "\n".join(
         f"Option {LETTERS[i]}: {choice}" for i, choice in enumerate(choices)
     )
-    return QUESTION_TEMPLATE.format(question=question, choices_str=choices_lines)
+    return QUESTION_TEMPLATE.format(
+        question=question,
+        choices_str=choices_lines,
+        instruction=get_mc_prompt_instruction(mc_prompt_style),
+    )
 
 
 def get_correct_letter(answer_text: str, choices: list):
@@ -345,7 +356,7 @@ def main():
             choices = list(row["choices"])
             answer_text = str(row["answer"])
             correct_letter = get_correct_letter(answer_text, choices)
-            prompt = multi_prefix + build_prompt(question, choices)
+            prompt = multi_prefix + build_prompt(question, choices, mc_prompt_style=args.mc_prompt_style)
         elif is_open:
             audio_path = raw_audio_paths[0]
             prompt = OPEN_TEMPLATE.format(question=question)
@@ -357,7 +368,7 @@ def main():
             choices = list(row["choices"])
             answer_text = str(row["answer"])
             correct_letter = get_correct_letter(answer_text, choices)
-            prompt = build_prompt(question, choices)
+            prompt = build_prompt(question, choices, mc_prompt_style=args.mc_prompt_style)
 
         messages = [{"role": "user", "content": "<audio>" + prompt}]
         text = tokenizer.apply_chat_template(

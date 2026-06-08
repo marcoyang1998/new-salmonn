@@ -15,7 +15,14 @@ import torch
 import torchaudio
 import torch.nn.functional as F
 from transformers import AutoFeatureExtractor
-from inference_utils import ModelArguments, OVERRIDE_KEYS, maybe_init_qwen3_embedding_model, override_args_from_config
+from inference_utils import (
+    ModelArguments,
+    OVERRIDE_KEYS,
+    add_mc_prompt_style_arg,
+    get_mc_prompt_instruction,
+    maybe_init_qwen3_embedding_model,
+    override_args_from_config,
+)
 
 
 DATASET_ROOT = "/mnt/shared-storage-user/brainllm-share/data/MMSU"
@@ -28,12 +35,11 @@ QUESTION_PROMPTS = (
 
 QUESTION_TEMPLATE = (
     # "Answer the following multiple-choice question using only the correct option.\n"
-    "Listen to the audio and answer the following multiple-choice question."
+    "Listen to the audio and answer the following multiple-choice question.\n"
     "Question: {question}\n"
     "Choices:\n"
     "{choices_str}\n"
-    "Please output your final answer with a single letter. "
-    "For example, if you think the answer is Option A, please just output 'A'"
+    "{instruction}"
 )
 def str2bool(v):
     if isinstance(v, bool):
@@ -59,10 +65,11 @@ def parse_args():
     parser.add_argument("--concat_encoder_features", type=str2bool, default=None)
     parser.add_argument("--use_qa_prompt", type=str2bool, default=False,
                         help="Use the QA-style prompt template instead of the default MMSU prompt")
+    add_mc_prompt_style_arg(parser)
     return parser.parse_args()
 
 
-def build_prompt(question, choice_a, choice_b, choice_c, choice_d, use_qa_prompt=False):
+def build_prompt(question, choice_a, choice_b, choice_c, choice_d, use_qa_prompt=False, mc_prompt_style="neutral"):
     if use_qa_prompt:
         choices_str = (
             f"Option A: {choice_a}\n"
@@ -70,7 +77,11 @@ def build_prompt(question, choice_a, choice_b, choice_c, choice_d, use_qa_prompt
             f"Option C: {choice_c}\n"
             f"Option D: {choice_d}"
         )
-        return QUESTION_TEMPLATE.format(question=question, choices_str=choices_str)
+        return QUESTION_TEMPLATE.format(
+            question=question,
+            choices_str=choices_str,
+            instruction=get_mc_prompt_instruction(mc_prompt_style),
+        )
     choices = f"A. {choice_a}\nB. {choice_b}\nC. {choice_c}\nD. {choice_d}"
     return f"{QUESTION_PROMPTS}\n\nQuestion: {question}\n\n{choices}"
 
@@ -280,7 +291,15 @@ def main():
             choice_c = item.get("choice_c", "")
             choice_d = item.get("choice_d", "")
 
-            prompt = build_prompt(question, choice_a, choice_b, choice_c, choice_d, use_qa_prompt=args.use_qa_prompt)
+            prompt = build_prompt(
+                question,
+                choice_a,
+                choice_b,
+                choice_c,
+                choice_d,
+                use_qa_prompt=args.use_qa_prompt,
+                mc_prompt_style=args.mc_prompt_style,
+            )
 
             messages = [{"role": "user", "content": "<audio>" + prompt}]
             text = tokenizer.apply_chat_template(

@@ -16,6 +16,10 @@ from torchaudio.transforms import MelSpectrogram
 from transformers import AutoFeatureExtractor, WhisperFeatureExtractor, AutoProcessor
 import soundfile as sf
 PETRELOSS_CONFIG = "/mnt/shared-storage-user/housiyuan/xiaoyu/petreloss.conf"
+MC_PROMPT_INSTRUCTIONS = {
+    "neutral": "Please output only the single letter corresponding to the correct option.",
+    "legacy": "Please output your final answer with a single letter. For example, if you think the answer is Option A, please just output 'A'.",
+}
 
 def load_audio_from_petrel_oss(audio_path: str, client):
     bytes_data = client.get(audio_path)
@@ -36,6 +40,12 @@ class SALMONN_Dataset(Dataset):
         self.audio_chunk = audio_chunk * 16000 # TODO: make this optional
         self.split_audio = args.split_audio
         self.shuffle_mc_options = bool(getattr(args, "shuffle_mc_options", True))
+        self.mc_prompt_style = str(getattr(args, "mc_prompt_style", "neutral")).lower()
+        if self.mc_prompt_style not in MC_PROMPT_INSTRUCTIONS:
+            raise ValueError(
+                f"Unsupported mc_prompt_style={self.mc_prompt_style!r}. "
+                f"Expected one of {sorted(MC_PROMPT_INSTRUCTIONS)}."
+            )
         self.skip_thinking_token_loss = bool(getattr(args, "skip_thinking_token_loss", False))
         self.ctx_biasing_list_min_ratio = float(getattr(args, "ctx_biasing_list_min_ratio", 0.5))
         self.ctx_biasing_list_max_ratio = float(getattr(args, "ctx_biasing_list_max_ratio", 1.0))
@@ -210,7 +220,7 @@ class SALMONN_Dataset(Dataset):
             if option["is_correct"]:
                 answer_label = label
         lines.append("")
-        lines.append('Please output your final answer with a single letter. For example, if you think the answer is Option A, please just output \'A\'.')
+        lines.append(MC_PROMPT_INSTRUCTIONS[self.mc_prompt_style])
 
         if answer_label is None:
             raise ValueError("Cannot determine correct answer for multiple-choice sample.")

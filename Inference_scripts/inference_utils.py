@@ -10,6 +10,30 @@ import json
 import logging
 import os
 
+MC_PROMPT_INSTRUCTIONS = {
+    "neutral": "Please output only the single letter corresponding to the correct option.",
+    "legacy": "Please output your final answer with a single letter. For example, if you think the answer is Option A, please just output 'A'",
+}
+
+
+def get_mc_prompt_instruction(style: str = "neutral") -> str:
+    style = str(style).lower()
+    if style not in MC_PROMPT_INSTRUCTIONS:
+        raise ValueError(
+            f"Unsupported mc_prompt_style={style!r}. "
+            f"Expected one of {sorted(MC_PROMPT_INSTRUCTIONS)}."
+        )
+    return MC_PROMPT_INSTRUCTIONS[style]
+
+
+def add_mc_prompt_style_arg(parser):
+    parser.add_argument(
+        "--mc_prompt_style",
+        choices=sorted(MC_PROMPT_INSTRUCTIONS),
+        default="neutral",
+        help="Multiple-choice prompt instruction style. Use 'legacy' for the old Option A example prompt.",
+    )
+
 
 @dataclass
 class ModelArguments:

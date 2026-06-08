@@ -14,19 +14,25 @@ import torchaudio
 import torch.nn.functional as F
 from transformers import AutoFeatureExtractor
 import soundfile as sf
-from inference_utils import ModelArguments, OVERRIDE_KEYS, maybe_init_qwen3_embedding_model, override_args_from_config
+from inference_utils import (
+    ModelArguments,
+    OVERRIDE_KEYS,
+    add_mc_prompt_style_arg,
+    get_mc_prompt_instruction,
+    maybe_init_qwen3_embedding_model,
+    override_args_from_config,
+)
 
 
 LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
 QUESTION_TEMPLATE = (
     # "Answer the following multiple-choice question using only the correct option.\n"
-    "Listen to the audio and answer the following multiple-choice question."
+    "Listen to the audio and answer the following multiple-choice question.\n"
     "Question: {question}\n"
     "Choices:\n"
     "{choices_str}\n"
-    "Please output your final answer with a single letter. "
-    "For example, if you think the answer is Option A, please just output 'A'"
+    "{instruction}"
 )
 
 # Encoders that share the same Fbank config and chunking logic
@@ -56,14 +62,19 @@ def parse_args():
     parser.add_argument("--output_path", type=str, required=True,
                         help="Path to write the annotated output JSON")
     parser.add_argument("--concat_encoder_features", type=str2bool, default=None)
+    add_mc_prompt_style_arg(parser)
     return parser.parse_args()
 
 
-def build_prompt(question: str, choices: list) -> str:
+def build_prompt(question: str, choices: list, mc_prompt_style: str = "neutral") -> str:
     choices_lines = "\n".join(
         f"Option {LETTERS[i]}: {choice}" for i, choice in enumerate(choices)
     )
-    return QUESTION_TEMPLATE.format(question=question, choices_str=choices_lines)
+    return QUESTION_TEMPLATE.format(
+        question=question,
+        choices_str=choices_lines,
+        instruction=get_mc_prompt_instruction(mc_prompt_style),
+    )
 
 
 def get_fbank(model_args):
@@ -276,7 +287,7 @@ def main():
 
     for i, item in enumerate(data):
         choices = item["choices"]
-        prompt = build_prompt(item["question"], choices)
+        prompt = build_prompt(item["question"], choices, mc_prompt_style=args.mc_prompt_style)
 
         rel = item["audio_id"].lstrip("./")
         audio_path = os.path.join(args.audio_root, rel)
