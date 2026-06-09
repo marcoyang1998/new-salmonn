@@ -2,6 +2,7 @@ import sys
 import io
 import json
 import math
+import os
 import random
 import string
 import copy
@@ -27,6 +28,61 @@ def load_audio_from_petrel_oss(audio_path: str, client):
     return waveform, orig_sr
 
 class SALMONN_Dataset(Dataset):
+    def _load_data_from_path(self, data_path: str):
+        with open(data_path, "r") as f:
+            data = json.load(f)["data"]
+        print(f"[Dataset] Loaded {len(data):,} entries from {data_path}", flush=True)
+        return data
+
+    def _load_data_from_manifest(self, manifest_path: str):
+        manifest_dir = os.path.dirname(os.path.abspath(manifest_path))
+        with open(manifest_path, "r") as f:
+            manifest_content = f.read()
+        json_paths = [line.strip() for line in manifest_content.splitlines() if line.strip()]
+
+        if not json_paths:
+            raise ValueError(f"Dataset manifest is empty: {manifest_path}")
+
+        output_dir = getattr(self.args, "output_dir", "")
+        rank = int(os.environ.get("RANK", "0"))
+        if output_dir and rank == 0:
+            os.makedirs(output_dir, exist_ok=True)
+            output_path = os.path.join(output_dir, "data_path_list.txt")
+            with open(output_path, "w") as f:
+                f.write(manifest_content)
+            print(f"[Dataset] Saved data_path_list to {output_path}", flush=True)
+
+        resolved_paths = [
+            path if os.path.isabs(path) else os.path.join(manifest_dir, path)
+            for path in json_paths
+        ]
+
+        path_entries = {}
+        path_repeats = {}
+        for path in resolved_paths:
+            path_repeats[path] = path_repeats.get(path, 0) + 1
+            if path not in path_entries:
+                with open(path, "r") as f:
+                    path_entries[path] = json.load(f)["data"]
+
+        data = []
+        for path in resolved_paths:
+            data.extend(path_entries[path])
+
+        print(f"[Dataset] Combining datasets from {manifest_path}", flush=True)
+        for path, repeats in path_repeats.items():
+            entries = len(path_entries[path])
+            print(
+                f"  {path}: {entries:,} entries x {repeats} = {entries * repeats:,}",
+                flush=True,
+            )
+        print(
+            f"[Dataset] Combined {len(resolved_paths):,} dataset entries from manifest "
+            f"into {len(data):,} training samples.",
+            flush=True,
+        )
+        return data
+
     def __init__(self, args, tokenizer, encoder_type, llm_type):
         super().__init__()
 
@@ -67,7 +123,13 @@ class SALMONN_Dataset(Dataset):
                 f"but got {self.p_drop_speaker_adaptation}."
             )
 
-        self.data = json.load(open(args.data_path, "r"))["data"]
+        data_path_list = getattr(args, "data_path_list", "")
+        if data_path_list:
+            self.data = self._load_data_from_manifest(data_path_list)
+        elif args.data_path:
+            self.data = self._load_data_from_path(args.data_path)
+        else:
+            raise ValueError("Either data_path or data_path_list must be specified.")
 
         max_dur = getattr(args, "max_audio_duration", -1)
         if max_dur > 0:

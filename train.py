@@ -61,6 +61,10 @@ class ModelArguments:
 @dataclass
 class DataArguments:
     data_path: Optional[str] = field(default="")
+    data_path_list: Optional[str] = field(
+        default="",
+        metadata={"help": "Optional text file listing dataset JSON files to combine. If set, data_path is ignored."},
+    )
     split_audio: bool = field(default=False)
     audio_chunk: int = field(default=60, metadata={"help": "Audio chunk size in seconds when split_audio is True."})
     shuffle_mc_options: bool = field(default=True)
@@ -179,6 +183,7 @@ def load_model_and_dataset(model_args, data_args, training_args):
         )
     if model_args.use_reasoning_network and model_args.num_pause_steps > 0 and model_args.use_qwen3_embedding_model:
         model.init_qwen3_embedding_model()
+    data_args.output_dir = training_args.output_dir
     dataset = SALMONN_Dataset(data_args, tokenizer, model_args.encoder_type, model_args.llm_type)
     if model_args.inject_temporal_embedding:
         model.register_temporal_tokens(tokenizer)
