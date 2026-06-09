@@ -37,7 +37,7 @@ class SALMONN_Dataset(Dataset):
     def _load_data_from_manifest(self, manifest_path: str):
         with open(manifest_path, "r") as f:
             manifest_content = f.read()
-        json_paths = [line.strip() for line in manifest_content.splitlines() if line.strip()]
+        json_paths = [line.split("#")[0].strip() for line in manifest_content.splitlines() if line.strip()]
 
         if not json_paths:
             raise ValueError(f"Dataset manifest is empty: {manifest_path}")
@@ -96,6 +96,11 @@ class SALMONN_Dataset(Dataset):
                 f"Unsupported mc_prompt_style={self.mc_prompt_style!r}. "
                 f"Expected one of {sorted(MC_PROMPT_INSTRUCTIONS)}."
             )
+        print(
+            f"Shuffle MC options: {self.shuffle_mc_options}, "
+            f"MC prompt style: {self.mc_prompt_style}",
+            flush=True
+        )
         self.skip_thinking_token_loss = bool(getattr(args, "skip_thinking_token_loss", False))
         self.ctx_biasing_list_min_ratio = float(getattr(args, "ctx_biasing_list_min_ratio", 0.5))
         self.ctx_biasing_list_max_ratio = float(getattr(args, "ctx_biasing_list_max_ratio", 1.0))
