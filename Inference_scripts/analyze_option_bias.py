@@ -11,7 +11,8 @@ Reports:
   3. Predicted A/B/C/D proportions on 4-way questions.
 
 Each section also reports reliability for each predicted option, i.e.
-accuracy conditioned on the model predicting that option.
+accuracy conditioned on the model predicting that option, plus the
+absolute answer-label count for each option.
 """
 
 from __future__ import annotations
@@ -87,7 +88,7 @@ def prediction_index(record: Dict[str, Any], choices: List[str]) -> Optional[int
             if index is not None:
                 return index
 
-    for key in ("model_prediction", "predicted_answer"):
+    for key in ("model_prediction", "predicted_answer", "model_output"):
         if key in record:
             index = index_from_letter(record[key], len(choices))
             if index is not None:
@@ -154,14 +155,18 @@ def percent(numerator: int, denominator: int) -> str:
 
 
 def section_stats(examples: List[Dict[str, Any]], labels: str) -> Dict[str, Dict[str, int]]:
-    stats = {label: {"predicted": 0, "with_gold": 0, "correct": 0} for label in labels}
+    stats = {label: {"predicted": 0, "answer": 0, "with_gold": 0, "correct": 0} for label in labels}
     for example in examples:
+        gold_idx = example["gold_idx"]
+        if gold_idx is not None and gold_idx < len(labels):
+            stats[labels[gold_idx]]["answer"] += 1
+
         pred_idx = example["pred_idx"]
         if pred_idx is None or pred_idx >= len(labels):
             continue
         label = labels[pred_idx]
         stats[label]["predicted"] += 1
-        if example["gold_idx"] is not None:
+        if gold_idx is not None:
             stats[label]["with_gold"] += 1
             stats[label]["correct"] += int(example["correct"])
     return stats
@@ -170,20 +175,22 @@ def section_stats(examples: List[Dict[str, Any]], labels: str) -> Dict[str, Dict
 def print_section(title: str, examples: List[Dict[str, Any]], labels: str) -> None:
     stats = section_stats(examples, labels)
     total_matched = sum(item["predicted"] for item in stats.values())
-    total_with_gold = sum(item["with_gold"] for item in stats.values())
+    total_with_gold = sum(item["answer"] for item in stats.values())
     print(f"\n{title}")
     print(f"Examples             : {len(examples):,}")
     print(f"Matched predictions  : {total_matched:,}")
     print(f"Gold labels available: {total_with_gold:,}")
-    print("Option  Correct/Predicted  Proportion  Reliability")
-    print("------  -----------------  ----------  -----------")
+    print("Option  Answer Count  Correct/Predicted  Proportion  Reliability")
+    print("------  ------------  -----------------  ----------  -----------")
     for label in labels:
+        answer_count = stats[label]["answer"]
         predicted = stats[label]["predicted"]
         with_gold = stats[label]["with_gold"]
         correct = stats[label]["correct"]
         reliability = percent(correct, with_gold) if with_gold else "N/A"
         print(
             f"{label:<6}  "
+            f"{answer_count:>12,}  "
             f"{correct:>5}/{predicted:<8}  "
             f"{percent(predicted, total_matched):>10}  "
             f"{reliability:>11}"
@@ -197,7 +204,6 @@ def main() -> None:
 
     records = load_records(args.path)
     examples, unmatched_predictions, unmatched_gold = collect_examples(records)
-    matched = [example for example in examples if example["pred_idx"] is not None]
     correct = sum(example["correct"] for example in examples)
 
     choice_lengths = Counter(example["num_choices"] for example in examples)
@@ -222,12 +228,12 @@ def main() -> None:
         print("Overall accuracy     : N/A (no ground-truth answers found)")
         print("Gold option counts   : N/A")
 
-    print_section("Overall Predicted A/B/C/D", matched, "ABCD")
+    print_section("Overall Predicted A/B/C/D", examples, "ABCD")
 
-    binary = [example for example in matched if example["num_choices"] == 2]
+    binary = [example for example in examples if example["num_choices"] == 2]
     print_section("Binary Questions Predicted A/B", binary, "AB")
 
-    four_way = [example for example in matched if example["num_choices"] == 4]
+    four_way = [example for example in examples if example["num_choices"] == 4]
     print_section("4-Way Questions Predicted A/B/C/D", four_way, "ABCD")
 
 
