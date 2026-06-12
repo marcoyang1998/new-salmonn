@@ -53,9 +53,11 @@ def main(
     use_oracle_biasing_list: bool = False,
     use_ctx_audio: bool = True,
     prompt_task_override: str = None,
+    lora_alpha: int = None,
 ):
     inference_manager = InferenceManager(
         checkpoint_path=checkpoint_path,
+        lora_alpha=lora_alpha,
         max_new_tokens=max_new_tokens,
         task_filter=task_filter,
         split_audio=split_audio,
@@ -148,6 +150,7 @@ if __name__ == "__main__":
     parser.add_argument("--use_oracle_biasing_list", type=str2bool, default=False, help="If True, use ground_truth_biasing_list instead of biasing_list for contextualised ASR prompts")
     parser.add_argument("--use_ctx_audio", type=str2bool, default=True, help="If True, use ctx_audios for speech-text contextualised ASR when present")
     parser.add_argument("--prompt_task_override", type=str, default=None, help="Override the task used for prompt construction without changing task filtering")
+    parser.add_argument("--lora_alpha", type=int, default=None, help="Override LoRA alpha value from checkpoint config")
 
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
@@ -186,4 +189,5 @@ if __name__ == "__main__":
         use_oracle_biasing_list=args.use_oracle_biasing_list,
         use_ctx_audio=args.use_ctx_audio,
         prompt_task_override=args.prompt_task_override,
+        lora_alpha=args.lora_alpha,
     )

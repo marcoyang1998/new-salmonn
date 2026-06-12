@@ -18,6 +18,7 @@ class InferenceManager:
     def __init__(
         self,
         checkpoint_path: str,
+        lora_alpha: Optional[int] = None,
         max_new_tokens=500,
         device=0,
         task_filter=None,
@@ -39,6 +40,9 @@ class InferenceManager:
     ):
         self.model_args = get_model_args(checkpoint_path)
         self.model_args = override_args_from_config(checkpoint_path, self.model_args)
+        if lora_alpha is not None:
+            self.model_args.lora_alpha = lora_alpha
+            print(f"Overriding lora_alpha with value from command line: {self.model_args.lora_alpha}")
         self.max_new_tokens = max_new_tokens
         self.device = device
         self.task_filter = task_filter
