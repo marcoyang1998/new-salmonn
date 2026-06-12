@@ -108,7 +108,7 @@ OVERRIDE_KEYS = [
     "reasoning_network_dim",
     "lora",
     "lora_rank",
-    "lora_alpha"
+    "lora_alpha",
     "dora",
     "encoder_type",
     "encoder_lora",

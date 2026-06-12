@@ -67,6 +67,7 @@ def parse_args():
     parser.add_argument("--concat_encoder_features", type=str2bool, default=None)
     parser.add_argument("--use_af_prompt", type=str2bool, default=False,
                         help="Use 'Choose one among the following options' prompt format")
+    parser.add_argument("--lora_alpha", type=int, default=None, help="LoRA alpha value, if applicable")
     add_mc_prompt_style_arg(parser)
     return parser.parse_args()
 
@@ -244,6 +245,9 @@ def main():
     model_args = ModelArguments()
     model_args.model_name_or_path = args.model_name_or_path
     model_args = override_args_from_config(args.model_name_or_path, model_args)
+    if args.lora_alpha is not None:
+        model_args.lora_alpha = args.lora_alpha
+        print(f"Overriding lora_alpha with value from command line: {model_args.lora_alpha}")
 
     if args.encoder_type is not None:
         model_args.encoder_type = args.encoder_type
