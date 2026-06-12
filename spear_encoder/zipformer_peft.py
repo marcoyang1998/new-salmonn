@@ -77,7 +77,7 @@ class PeftFriendlyActivationDropoutAndLinear(nn.Module):
             x = SwooshRForward(x)
         else:
             assert False, self.activation
-        return torch.nn.functional.linear(x, self.linear.weight, self.linear.bias)
+        return self.linear(x)
 
 
 def convert_activation_dropout_and_linear_in_place(module: nn.Module) -> int:
