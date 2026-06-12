@@ -3,7 +3,7 @@ import sys
 import json
 import math
 import pathlib
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace
 from typing import Optional, List, Union
 import logging
 logging.basicConfig(level=logging.WARNING, force=True)
@@ -113,6 +113,13 @@ class TrainingArguments(transformers.TrainingArguments):
                           "checkpoint where the LLM was frozen (no LoRA) into a stage "
                           "where LoRA is enabled."}
     )
+    continue_full_ckpt_with_lora: bool = field(
+        default=False,
+        metadata={"help": "Load a full non-LoRA SALMONN checkpoint first, then apply "
+                          "LLM LoRA/DoRA and/or encoder LoRA for continued fine-tuning. "
+                          "Use a fresh output_dir so optimizer state is not resumed from "
+                          "the source checkpoint."}
+    )
     encoder_lr_ratio: Optional[float] = field(
         default=1.0,
         metadata={"help": "LR multiplier for the audio encoder parameters (e.g. 0.1 = 1/10 of base LR). "
@@ -170,6 +177,28 @@ def load_model_and_dataset(model_args, data_args, training_args):
         model_config.attn_implementation = model_args.attn_implementation
         model = SALMONN(model_config, model_args)
         _load_non_llm_weights(model, model_args.model_name_or_path)
+    elif training_args.continue_full_ckpt_with_lora:
+        tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path)
+        model_config = AutoConfig.from_pretrained(os.path.join(model_args.model_name_or_path, "config.json"))
+
+        load_model_args = replace(
+            model_args,
+            lora=False,
+            dora=False,
+            encoder_lora=False,
+        )
+        model = SALMONN.from_pretrained(
+            model_args.model_name_or_path,
+            config=model_config,
+            model_args=load_model_args,
+            torch_dtype="auto",
+            low_cpu_mem_usage=False,
+        )
+
+        if model_args.lora or model_args.dora:
+            model.apply_llm_lora(model_args)
+        if model_args.encoder_lora:
+            model.apply_encoder_lora(model_args, strict=True)
     else:
         tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path)
         model_config = AutoConfig.from_pretrained(os.path.join(model_args.model_name_or_path,"config.json"))
@@ -198,6 +227,28 @@ def main():
     if training_args.remove_unused_columns:
         print("[train] Overriding remove_unused_columns=True -> False so collator-only fields like user_prompt are preserved.")
         training_args.remove_unused_columns = False
+
+    if training_args.continue_full_ckpt_with_lora:
+        if training_args.from_scratch or training_args.from_freeze_llm:
+            raise ValueError(
+                "continue_full_ckpt_with_lora cannot be combined with from_scratch "
+                "or from_freeze_llm."
+            )
+        if not model_args.model_name_or_path:
+            raise ValueError("continue_full_ckpt_with_lora requires model_name_or_path.")
+        if not (model_args.lora or model_args.dora or model_args.encoder_lora):
+            raise ValueError(
+                "continue_full_ckpt_with_lora requires at least one of "
+                "lora=True, dora=True, or encoder_lora=True."
+            )
+        if model_args.encoder_lora and model_args.freeze_encoder:
+            print(
+                "[train] continue_full_ckpt_with_lora + encoder_lora=True requires "
+                "encoder forward gradients for adapter updates; overriding "
+                "freeze_encoder=True -> False. Base encoder weights remain frozen "
+                "by the encoder LoRA wrapper."
+            )
+            model_args.freeze_encoder = False
 
     config = {
         "model_args": asdict(model_args),
