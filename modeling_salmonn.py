@@ -128,20 +128,7 @@ class SALMONN(PreTrainedModel):
             )
 
         if model_args.lora or dora:
-            for name, param in self.base_llm.named_parameters():
-                param.requires_grad = False
-            lora_kwargs = dict(
-                task_type=TaskType.CAUSAL_LM,
-                inference_mode=False,
-                r=model_args.lora_rank,
-                lora_alpha=model_args.lora_alpha,
-                lora_dropout=model_args.lora_dropout,
-                use_dora=dora,
-            )
-            if expand_vocab:
-                lora_kwargs["modules_to_save"] = ["embed_tokens", "lm_head"]
-                self.base_llm.config.tie_word_embeddings = False
-            self.base_llm = get_peft_model(self.base_llm, LoraConfig(**lora_kwargs))
+            self.apply_llm_lora(model_args)
         elif expand_vocab:
             # No LoRA: freeze the entire LLM body except embed_tokens and lm_head,
             # which must be trainable so the new token rows receive gradient updates.
@@ -183,23 +170,8 @@ class SALMONN(PreTrainedModel):
                 )
                 print(f"Loading info: {info}")
         encoder_lora = getattr(model_args, "encoder_lora", False)
-        if model_args.encoder_type == "zipformer2" and encoder_lora:
-            self.audio_encoder = apply_zipformer_encoder_peft(self.audio_encoder, model_args)
-            # we decided not to set to eval()
-            # self.audio_encoder.eval()
-        elif model_args.encoder_type == "spear_transformer" and encoder_lora:
-            encoder_lora_config = LoraConfig(
-                r=model_args.encoder_lora_rank,
-                lora_alpha=model_args.encoder_lora_alpha,
-                lora_dropout=model_args.encoder_lora_dropout,
-                target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                                "gate_proj", "up_proj", "down_proj"],
-                inference_mode=False,
-            )
-            self.audio_encoder = get_peft_model(self.audio_encoder, encoder_lora_config)
-            for name, param in self.audio_encoder.named_parameters():
-                param.requires_grad = "lora_" in name
-            # do not call eval() — same rationale as zipformer2 path above
+        if encoder_lora:
+            self.apply_encoder_lora(model_args)
         # This will freeze all encoder parameters, no matter if it's a LoRA or not
         if model_args.freeze_encoder:
             for name, param in self.audio_encoder.named_parameters():
@@ -595,6 +567,87 @@ class SALMONN(PreTrainedModel):
     
     def _can_record_outputs(self):
         return getattr(self.base_llm, "_can_record_outputs", {})
+
+    def apply_llm_lora(self, model_args):
+        dora = getattr(model_args, "dora", False)
+        use_lora = getattr(model_args, "lora", False)
+        expand_vocab = getattr(model_args, "expand_vocab", False)
+        freeze_llm = getattr(model_args, "freeze_llm", False)
+
+        if not (use_lora or dora):
+            return False
+        if freeze_llm:
+            raise ValueError("freeze_llm=True is incompatible with applying LLM LoRA/DoRA.")
+        if use_lora and dora:
+            raise ValueError("lora=True and dora=True are mutually exclusive.")
+        if is_peft_model(self.base_llm):
+            raise ValueError("base_llm is already a PEFT model; refusing to apply LLM LoRA twice.")
+
+        for _, param in self.base_llm.named_parameters():
+            param.requires_grad = False
+
+        lora_kwargs = dict(
+            task_type=TaskType.CAUSAL_LM,
+            inference_mode=False,
+            r=model_args.lora_rank,
+            lora_alpha=model_args.lora_alpha,
+            lora_dropout=model_args.lora_dropout,
+            use_dora=dora,
+        )
+        if expand_vocab:
+            lora_kwargs["modules_to_save"] = ["embed_tokens", "lm_head"]
+            self.base_llm.config.tie_word_embeddings = False
+
+        self.base_llm = get_peft_model(self.base_llm, LoraConfig(**lora_kwargs))
+        num_trainable = sum(param.numel() for param in self.base_llm.parameters() if param.requires_grad)
+        num_param = sum(param.numel() for param in self.base_llm.parameters())
+        print(
+            "[SALMONN] Applied LoRA/DoRA to base_llm; "
+            f"trainable parameters = {num_trainable} ({num_trainable / num_param * 100:.3f}% of the LLM wrapper)."
+        )
+        return True
+
+    def apply_encoder_lora(self, model_args, strict=False):
+        if not getattr(model_args, "encoder_lora", False):
+            return False
+
+        if model_args.encoder_type == "zipformer2":
+            self.audio_encoder = apply_zipformer_encoder_peft(self.audio_encoder, model_args)
+            applied = True
+        elif model_args.encoder_type == "spear_transformer":
+            encoder_lora_config = LoraConfig(
+                r=model_args.encoder_lora_rank,
+                lora_alpha=model_args.encoder_lora_alpha,
+                lora_dropout=model_args.encoder_lora_dropout,
+                target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                                "gate_proj", "up_proj", "down_proj"],
+                inference_mode=False,
+            )
+            self.audio_encoder = get_peft_model(self.audio_encoder, encoder_lora_config)
+            for name, param in self.audio_encoder.named_parameters():
+                param.requires_grad = "lora_" in name
+            applied = True
+        else:
+            msg = (
+                f"encoder_lora=True is not implemented for encoder_type={model_args.encoder_type!r}; "
+                "currently supported: 'zipformer2', 'spear_transformer'."
+            )
+            if strict:
+                raise ValueError(msg)
+            print(f"[SALMONN] WARNING: {msg}")
+            return False
+
+        # Encoder LoRA freezes the base encoder weights but still needs gradients
+        # through the encoder forward pass so adapter weights can update.
+        self.freeze_encoder = False
+        self._encoder_frozen = False
+        num_trainable = sum(param.numel() for param in self.audio_encoder.parameters() if param.requires_grad)
+        num_param = sum(param.numel() for param in self.audio_encoder.parameters())
+        print(
+            "[SALMONN] Applied LoRA to audio_encoder; "
+            f"trainable parameters = {num_trainable} ({num_trainable / num_param * 100:.3f}% of the audio encoder)."
+        )
+        return applied
     
     def get_audio_encoder(self, model_args):
         if model_args.encoder_type == "zipformer2":
