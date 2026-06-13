@@ -34,6 +34,7 @@ ASR_PROMPTS = [
 ]
 
 ALLOWED_PUNCTUATION = {",", ".", "!", "?", "'"}
+DASH_CHARS = "-\u2010\u2011\u2012\u2013\u2014\u2015"
 
 
 def read_json(path: Path) -> Any:
@@ -54,7 +55,8 @@ def unwrap_records(payload: Any, path: Path) -> List[Dict[str, Any]]:
 
 def normalize_transcript(text: Any) -> str:
     text = str(text).strip()
-    text = text.replace("--", "").replace('"', "")
+    text = text.replace('"', "")
+    text = text.translate(str.maketrans({char: " " for char in DASH_CHARS}))
 
     kept_chars = []
     for char in text:
