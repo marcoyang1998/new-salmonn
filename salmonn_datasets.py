@@ -130,22 +130,23 @@ class SALMONN_Dataset(Dataset):
         else:
             raise ValueError("Either data_path or data_path_list must be specified.")
 
+        def _valid_durations(entry):
+            return [d for d in entry.get("durations", []) if d >= 0]
+
+        def _total_duration(entry):
+            return sum(_valid_durations(entry))
+
         max_dur = getattr(args, "max_audio_duration", -1)
         if max_dur > 0:
             def _total_hours(entries):
-                total_s = sum(
-                    d
-                    for e in entries
-                    for d in e.get("durations", [])
-                    if d >= 0
-                )
+                total_s = sum(_total_duration(e) for e in entries)
                 return total_s / 3600
 
             before_count = len(self.data)
             before_hours = _total_hours(self.data)
             self.data = [
                 e for e in self.data
-                if all(d < max_dur for d in e.get("durations", []) if d >= 0)
+                if _total_duration(e) <= max_dur
             ]
             after_count = len(self.data)
             after_hours = _total_hours(self.data)
@@ -166,7 +167,7 @@ class SALMONN_Dataset(Dataset):
         before_count = len(self.data)
         self.data = [
             e for e in self.data
-            if all(d >= min_dur for d in e.get("durations", []) if d >= 0)
+            if all(d >= min_dur for d in _valid_durations(e))
         ]
         removed = before_count - len(self.data)
         print(
@@ -175,13 +176,10 @@ class SALMONN_Dataset(Dataset):
             flush=True,
         )
 
-        # lengths[i] = max audio duration (seconds) across all audios in sample i.
+        # lengths[i] = total audio duration (seconds) across all audios in sample i.
         # Used by AudioLengthGroupedSampler when group_by_audio_length=True.
         # Falls back to 0.0 for entries without a "durations" field.
-        self.lengths = [
-            max((d for d in e.get("durations", []) if d >= 0), default=0.0)
-            for e in self.data
-        ]
+        self.lengths = [_total_duration(e) for e in self.data]
 
         self.encoder_type = encoder_type
         self.llm_type = llm_type
