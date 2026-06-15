@@ -12,7 +12,11 @@ import time
 from pathlib import Path
 from typing import Any
 
+import numpy as np
+import torch
 from funasr import AutoModel
+from funasr.models.ct_transformer.utils import split_words
+from funasr.train_utils.device_funcs import to_device
 from tqdm import tqdm
 
 
@@ -67,6 +71,99 @@ def result_text(result: Any) -> str:
     return str(result)
 
 
+def build_punctuated_text(tokens: list[str], punctuations: list[int], punc_list: list[str]) -> str:
+    words_with_punc: list[str] = []
+    for i, token in enumerate(tokens):
+        if (
+            i == 0
+            or punc_list[punctuations[i - 1]] == "。"
+            or punc_list[punctuations[i - 1]] == "？"
+        ) and len(token[0].encode()) == 1:
+            token = token.capitalize()
+        if i == 0 and len(token[0].encode()) == 1:
+            token = " " + token
+        if i > 0:
+            if len(token[0].encode()) == 1 and len(tokens[i - 1][0].encode()) == 1:
+                token = " " + token
+
+        words_with_punc.append(token)
+        if punc_list[punctuations[i]] != "_":
+            punc = punc_list[punctuations[i]]
+            if len(token[0].encode()) == 1:
+                if punc == "，":
+                    punc = ","
+                elif punc == "。":
+                    punc = "."
+                elif punc == "？":
+                    punc = "?"
+            words_with_punc.append(punc)
+
+    punctuated = "".join(words_with_punc)
+    if not punctuated:
+        return punctuated
+    if punctuated[-1] in ("，", "、"):
+        return punctuated[:-1] + "。"
+    if punctuated[-1] == ",":
+        return punctuated[:-1] + "."
+    if punctuated[-1] not in ("。", "？") and len(punctuated[-1].encode()) != 1:
+        return punctuated + "。"
+    if punctuated[-1] not in (".", "?") and len(punctuated[-1].encode()) == 1:
+        return punctuated + "."
+    return punctuated
+
+
+def generate_ct_punc_batch(model: AutoModel, texts: list[str], batch_size: int) -> list[str]:
+    ct_model = getattr(model, "model", None)
+    tokenizer = getattr(model, "kwargs", {}).get("tokenizer")
+    device = getattr(model, "kwargs", {}).get("device", "cpu")
+    if not (hasattr(ct_model, "punc_forward") and hasattr(ct_model, "punc_list") and tokenizer):
+        raise TypeError("AutoModel does not expose CT-Transformer batch internals.")
+
+    outputs: list[str] = []
+    for batch_start in range(0, len(texts), batch_size):
+        text_batch = texts[batch_start : batch_start + batch_size]
+        token_batch = [
+            split_words(text, jieba_usr_dict=getattr(ct_model, "jieba_usr_dict", None))
+            for text in text_batch
+        ]
+        ids_batch = [np.asarray(tokenizer.encode(tokens), dtype="int64") for tokens in token_batch]
+        lengths = [len(ids) for ids in ids_batch]
+        max_len = max(lengths, default=0)
+        if max_len == 0:
+            outputs.extend([""] * len(text_batch))
+            continue
+
+        padded = np.zeros((len(ids_batch), max_len), dtype="int64")
+        for i, ids in enumerate(ids_batch):
+            if len(ids):
+                padded[i, : len(ids)] = ids
+
+        data = {
+            "text": torch.from_numpy(padded),
+            "text_lengths": torch.from_numpy(np.asarray(lengths, dtype="int32")),
+        }
+        data = to_device(data, device)
+        with torch.no_grad():
+            y, _ = ct_model.punc_forward(**data)
+            predictions = y.argmax(dim=-1).detach().cpu().numpy()
+
+        for tokens, length, prediction in zip(token_batch, lengths, predictions):
+            punctuations = [int(x) for x in prediction[:length]]
+            outputs.append(build_punctuated_text(tokens, punctuations, ct_model.punc_list))
+
+    return outputs
+
+
+def generate_with_funasr_wrapper(model: AutoModel, texts: list[str], batch_size: int) -> list[str]:
+    try:
+        return [result_text(result) for result in model.generate(input=texts, batch_size=batch_size)]
+    except AssertionError:
+        results = []
+        for text in texts:
+            results.extend(model.generate(input=[text], batch_size=1))
+        return [result_text(result) for result in results]
+
+
 def punctuate_batch(
     model: AutoModel,
     records: list[dict[str, Any]],
@@ -77,22 +174,17 @@ def punctuate_batch(
         return 0, 0, 0
 
     try:
-        results = model.generate(input=texts, batch_size=batch_size)
-    except AssertionError:
-        tqdm.write(
-            "FunASR ct-punc rejected multi-text inference; falling back to "
-            "single-text calls for this batch."
-        )
-        results = []
-        for text in texts:
-            results.extend(model.generate(input=[text], batch_size=1))
-    if len(results) != len(texts):
+        candidates = generate_ct_punc_batch(model, texts, batch_size)
+    except Exception as exc:
+        tqdm.write(f"Direct batched CT-punc failed ({exc}); using FunASR wrapper fallback.")
+        candidates = generate_with_funasr_wrapper(model, texts, batch_size)
+
+    if len(candidates) != len(texts):
         return 0, len(texts), len(texts)
 
     accepted = 0
     rejected = 0
-    for original, result, (record_idx, supervision_idx) in zip(texts, results, locations):
-        candidate = result_text(result)
+    for original, candidate, (record_idx, supervision_idx) in zip(texts, candidates, locations):
         if depunctuate(candidate) == original:
             records[record_idx]["supervisions"][supervision_idx]["text"] = candidate
             accepted += 1
