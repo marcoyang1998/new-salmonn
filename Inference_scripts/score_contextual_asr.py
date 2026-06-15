@@ -245,14 +245,16 @@ def load_jsonl_records(path):
             if not line:
                 continue
             item = json.loads(line)
-            if item.get("task") and item.get("task") != "contextualised_asr":
-                continue
 
-            biasing_words = item.get("ground_truth_biasing_list")
-            if biasing_words is None:
-                biasing_words = item.get("biasing_list", [])
+            if "ground_truth_biasing_list" not in item:
+                raise ValueError(
+                    f"Missing ground_truth_biasing_list in {path} at line {line_no}."
+                )
+            biasing_words = item["ground_truth_biasing_list"]
             if not isinstance(biasing_words, list):
-                biasing_words = []
+                raise ValueError(
+                    f"ground_truth_biasing_list must be a list in {path} at line {line_no}."
+                )
 
             records.append(
                 {
@@ -589,7 +591,7 @@ if __name__ ==  "__main__":
         "--input-jsonl",
         default=None,
         help="Path to inference result jsonl. Each line should contain text, response, "
-        "and ground_truth_biasing_list or biasing_list.",
+        "and ground_truth_biasing_list.",
     )
     parser.add_argument(
         "--refs",
