@@ -213,14 +213,25 @@ class SALMONN_Dataset(Dataset):
         self._broken_audio_paths = set()
         self.broken_sample_max_retries = max(1, int(getattr(args, "broken_sample_max_retries", 32)))
 
-    def _load_audio(self, audio: str):
+    def _load_audio(self, audio: str, start_time=None, end_time=None):
         if audio.startswith("s3://"):
             if self.client is None:
                 from petrel_client.client import Client
                 self.client = Client(PETRELOSS_CONFIG)
-            return load_audio_from_petrel_oss(audio, self.client)
+            waveform, fs = load_audio_from_petrel_oss(audio, self.client)
         else:
-            return torchaudio.load(audio)
+            waveform, fs = torchaudio.load(audio)
+        if start_time is None and end_time is None:
+            return waveform, fs
+        if start_time is None or end_time is None:
+            raise ValueError(f"Both start_time and end_time must be provided for audio span loading: {audio}")
+        start_frame = max(0, int(round(float(start_time) * fs)))
+        end_frame = min(waveform.shape[1], int(round(float(end_time) * fs)))
+        if end_frame <= start_frame:
+            raise ValueError(
+                f"Invalid audio span for {audio}: start_time={start_time}, end_time={end_time}, fs={fs}"
+            )
+        return waveform[:, start_frame:end_frame], fs
     
     def __len__(self):
         return len(self.data)
@@ -558,6 +569,16 @@ class SALMONN_Dataset(Dataset):
 
     def _get_grouped_sample_audio_paths(self, sample: Dict):
         main_audio_paths = list(sample["audios"])
+        start_times = sample.get("start_time")
+        end_times = sample.get("end_time")
+        if start_times is None and end_times is None:
+            main_audio_spans = [(None, None)] * len(main_audio_paths)
+        elif isinstance(start_times, list) and isinstance(end_times, list) and len(start_times) == len(main_audio_paths) and len(end_times) == len(main_audio_paths):
+            main_audio_spans = list(zip(start_times, end_times))
+        else:
+            raise ValueError(
+                "start_time and end_time must both be lists aligned with audios when present."
+            )
         ctx_audio_paths = []
         if sample.get("task_type") == "contextual_ASR" and "ctx_audios" in sample:
             ctx_audio_paths = sample.get("ctx_audios", [])
@@ -567,7 +588,10 @@ class SALMONN_Dataset(Dataset):
             ctx_audio_paths = sample.get("ctx_audios", [])
             if not isinstance(ctx_audio_paths, list):
                 raise ValueError("ctx_audios must be a list when present.")
-        return [(audio_path, 0) for audio_path in main_audio_paths] + [(audio_path, 1) for audio_path in ctx_audio_paths]
+        return [
+            (audio_path, 0, start_time, end_time)
+            for audio_path, (start_time, end_time) in zip(main_audio_paths, main_audio_spans)
+        ] + [(audio_path, 1, None, None) for audio_path in ctx_audio_paths]
     
     def __getitem__(self, index):
         for attempt in range(self.broken_sample_max_retries):
@@ -596,11 +620,11 @@ class SALMONN_Dataset(Dataset):
         audio_nums = []
         audio_feature_groups = []
         audio_files = []
-        for audio_path, audio_group in self._get_grouped_sample_audio_paths(sample):
+        for audio_path, audio_group, start_time, end_time in self._get_grouped_sample_audio_paths(sample):
             target_fbanks = fbanks if audio_group == 0 else ctx_fbanks
             target_fbank_lens = fbank_lens if audio_group == 0 else ctx_fbank_lens
             target_raw_wavs = raw_wavs if audio_group == 0 else ctx_raw_wavs
-            audio, fs = self._load_audio(audio_path)
+            audio, fs = self._load_audio(audio_path, start_time=start_time, end_time=end_time)
             duration = audio.shape[1] / fs
             if duration < self.min_audio_duration:
                 print(
