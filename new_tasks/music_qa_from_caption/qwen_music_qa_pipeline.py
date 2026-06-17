@@ -44,15 +44,37 @@ Requirements for the answers:
 5. Do not mention that the answer is based on a caption or text description. Write as if the evidence comes from the audio.
 6. Avoid adding general musicological claims unless they are directly supported by the caption. Prefer rephrasing and synthesizing the given evidence over introducing new explanatory details.
 
-Recommended QA types:
+When generating multiple QA pairs, choose distinct reasoning directions from the following list. Do not use the same reasoning direction more than once for the same caption.
 
-* Holistic music analysis
-* Style or genre inference
-* Mood and emotional interpretation
-* Instrumentation and timbre reasoning
-* Melody, harmony, rhythm, and tempo analysis
-* Dynamics and expressive shaping
-* Why the music fits or does not fit a certain style or scene
+Possible reasoning directions:
+1. Holistic inference: infer the overall style, mood, or expressive character from multiple musical cues.
+2. Contrastive reasoning: explain why the music fits one style, mood, or setting better than another plausible alternative.
+3. Structural evidence: analyze how rhythm, harmony, melody, dynamics, timbre, texture, or instrumentation support a specific interpretation.
+4. Negative evidence: identify what is absent from the audio and how that absence helps rule out other interpretations, such as vocals, drums, dense ensemble texture, or high-energy production.
+5. Functional / scene inference: infer what kind of scene, background use, or listening context the music would support, grounded only in the musical evidence.
+6. Temporal / phrase-shaping analysis: explain how tempo, rhythmic consistency, crescendos, decrescendos, or phrase shaping affect the listener's perception over time.
+7. Performer / acoustic presentation analysis: discuss how articulation, timbre, dynamics, and texture affect the perceived intimacy, clarity, or expressive quality of the performance.
+8. Ranking or emphasis question: ask which musical cue is most important for a particular effect, and explain why.
+
+The three questions must not share the same surface pattern. In particular, do not make more than one question use the form "How do X and Y work together/contribute to Z?"
+
+Question surface-form diversity:
+Do not overuse "How do/does..." questions. For each set of 3 QA pairs, at most one question may begin with "How do", "How does", "How can", or "In what ways".
+
+Use varied question forms. Prefer questions beginning with different patterns, such as:
+- What evidence suggests that ...
+- Why is this piece better described as ... rather than ...?
+- What makes the music feel ...?
+- Which musical cues indicate ...?
+- What can be inferred about ... from ...?
+- Why would this music be suitable for ...?
+- What aspects of the audio rule out ...?
+- Which feature is most responsible for ..., and why?
+- How does ...?
+
+For exactly 3 QA pairs, use three different surface forms. At least one question should involve contrastive or negative-evidence reasoning. At most one question should ask how multiple features work together.
+
+Do not force every caption to use all of these directions. Choose the most suitable and non-overlapping directions based on the information available in the provided description.
 
 Output format:
 Return only valid JSON as a list of objects:
@@ -77,6 +99,7 @@ def parse_args():
     parser.add_argument("--input", default=DEFAULT_INPUT, help="Input SALMONN-style music caption JSON.")
     parser.add_argument("--output", default=DEFAULT_OUTPUT, help="Output SALMONN-style QA JSON.")
     parser.add_argument("--tmp-output", default="", help="Checkpoint JSONL path. Defaults to <output>.tmp.jsonl.")
+    parser.add_argument("--failed-output", default="", help="Failed-sample JSONL path. Defaults to <output>.failed.jsonl.")
     parser.add_argument("--backend", choices=("local", "openai"), default="local", help="Run local transformers inference or use an OpenAI-compatible endpoint.")
     parser.add_argument("--base-url", default=os.environ.get("OPENAI_BASE_URL", ""), help="OpenAI-compatible API base URL.")
     parser.add_argument("--api-key", default=os.environ.get("OPENAI_API_KEY", ""), help="API key, preferably via OPENAI_API_KEY.")
@@ -85,8 +108,12 @@ def parse_args():
     parser.add_argument("--num-qa", type=int, default=DEFAULT_NUM_QA, help="Number of QA pairs per input item.")
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--max-tokens", type=int, default=2048, help="Maximum generated tokens for either backend.")
-    parser.add_argument("--top-p", type=float, default=0.95)
-    parser.add_argument("--do-sample", action="store_true", help="Use sampling for local generation. By default local generation is greedy.")
+    parser.add_argument("--top-p", type=float, default=0.8)
+    parser.add_argument("--top-k", type=int, default=20)
+    parser.add_argument("--min-p", type=float, default=0.0)
+    parser.add_argument("--presence-penalty", type=float, default=1.5)
+    parser.add_argument("--repetition-penalty", type=float, default=1.0)
+    parser.add_argument("--do-sample", action=argparse.BooleanOptionalAction, default=True, help="Use sampling for local generation.")
     parser.add_argument("--torch-dtype", default="auto", choices=("auto", "bfloat16", "float16", "float32"), help="Local model dtype.")
     parser.add_argument("--device-map", default="auto", help="Local model device_map, e.g. auto, cuda:0, cpu.")
     parser.add_argument("--attn-implementation", default="", help="Optional local attention implementation, e.g. flash_attention_2 or sdpa.")
@@ -203,54 +230,31 @@ def load_local_qwen(args):
     return model, tokenizer
 
 
-def call_local_qwen(model, tokenizer, args, prompt):
+def load_local_qwen(args):
     import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    messages = [{"role": "user", "content": prompt}]
-    try:
-        inputs = tokenizer.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_tensors="pt",
-            enable_thinking=False,
-        )
-    except TypeError:
-        inputs = tokenizer.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_tensors="pt",
-        )
-
-    if hasattr(model, "device"):
-        device = model.device
-    else:
-        device = next(model.parameters()).device
-    inputs = inputs.to(device)
-
-    generation_kwargs = {
-        "max_new_tokens": args.max_tokens,
-        "do_sample": args.do_sample,
-        "pad_token_id": tokenizer.eos_token_id,
+    dtype_map = {
+        "auto": "auto",
+        "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
+        "float32": torch.float32,
     }
-    if args.do_sample:
-        generation_kwargs.update({
-            "temperature": args.temperature,
-            "top_p": args.top_p,
-        })
+    model_kwargs = {
+        "torch_dtype": dtype_map[args.torch_dtype],
+        "device_map": args.device_map,
+        "trust_remote_code": args.trust_remote_code,
+    }
+    if args.attn_implementation:
+        model_kwargs["attn_implementation"] = args.attn_implementation
 
-    if isinstance(inputs, dict):
-        input_ids = inputs["input_ids"]
-        generate_inputs = inputs
-    else:
-        input_ids = inputs
-        generate_inputs = {"input_ids": inputs}
-
-    with torch.inference_mode():
-        output_ids = model.generate(**generate_inputs, **generation_kwargs)
-    generated_ids = output_ids[0, input_ids.shape[-1] :]
-    return tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model_path,
+        trust_remote_code=args.trust_remote_code,
+    )
+    model = AutoModelForCausalLM.from_pretrained(args.model_path, **model_kwargs)
+    model.eval()
+    return model, tokenizer
 
 
 def build_qa_salmonn_item(source_item, qa):
@@ -281,6 +285,12 @@ def load_checkpoint(path):
     return records
 
 
+def append_failed_record(path, record):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+
 def write_compact_salmonn_json(path, items):
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
@@ -291,23 +301,23 @@ def write_compact_salmonn_json(path, items):
         f.write("]}\n")
 
 
-def finalize_output(tmp_path, output_path, source_count, expected_num_qa):
+def finalize_output(tmp_path, output_path, source_count, expected_num_qa, require_complete=False):
     records = load_checkpoint(tmp_path)
     missing = [idx for idx in range(source_count) if idx not in records]
-    if missing:
+    if missing and require_complete:
         raise RuntimeError(
             f"Checkpoint is incomplete: {len(missing)} missing source items. "
             f"First missing index: {missing[0]}"
         )
 
     output_items = []
-    for idx in range(source_count):
+    for idx in sorted(records):
         qa_items = records[idx]["qa_items"]
         if len(qa_items) != expected_num_qa:
             raise ValueError(f"Checkpoint item {idx} has {len(qa_items)} QA items.")
         output_items.extend(qa_items)
     write_compact_salmonn_json(output_path, output_items)
-    return len(output_items)
+    return len(output_items), len(missing)
 
 
 def main():
@@ -315,6 +325,7 @@ def main():
     input_path = Path(args.input)
     output_path = Path(args.output)
     tmp_path = Path(args.tmp_output) if args.tmp_output else Path(str(output_path) + ".tmp.jsonl")
+    failed_path = Path(args.failed_output) if args.failed_output else Path(str(output_path) + ".failed.jsonl")
     data = load_salmonn_data(input_path)
 
     limit = args.limit if args.limit > 0 else (5 if args.debug else len(data))
@@ -322,8 +333,8 @@ def main():
     data = data[:limit]
 
     if args.finalize_only:
-        total = finalize_output(tmp_path, output_path, len(data), args.num_qa)
-        print(f"Wrote {total} QA training items to {output_path}")
+        total, missing = finalize_output(tmp_path, output_path, len(data), args.num_qa)
+        print(f"Wrote {total} QA training items to {output_path}; missing/skipped source items: {missing}")
         return
 
     if args.backend == "openai":
@@ -373,10 +384,21 @@ def main():
                     if attempt < args.max_retries:
                         time.sleep(args.retry_sleep * attempt)
             else:
-                raise RuntimeError(f"Failed to process source index {index}") from last_error
+                append_failed_record(
+                    failed_path,
+                    {
+                        "source_index": index,
+                        "error": repr(last_error),
+                    },
+                )
+                print(
+                    f"[ERROR] Skipping source index {index} after {args.max_retries} failed attempts. "
+                    f"Logged to {failed_path}",
+                    flush=True,
+                )
 
-    total = finalize_output(tmp_path, output_path, len(data), args.num_qa)
-    print(f"Wrote {total} QA training items to {output_path}")
+    total, missing = finalize_output(tmp_path, output_path, len(data), args.num_qa)
+    print(f"Wrote {total} QA training items to {output_path}; missing/skipped source items: {missing}")
 
 
 if __name__ == "__main__":
