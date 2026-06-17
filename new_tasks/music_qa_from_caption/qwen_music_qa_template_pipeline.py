@@ -122,6 +122,7 @@ Requirements for the answer:
 3. The answer should be concise but substantive, usually 2-5 sentences.
 4. Do not introduce new facts beyond the description.
 5. Do not mention that the answer is based on a caption or text description. Write as if the evidence comes from the audio.
+6. Use cautious, evidence-grounded language. Avoid overclaiming beyond the provided description. In particular, do not use overly definitive words such as "clearly", "obviously", "definitively", "undoubtedly", or "explicitly proves" unless the description directly warrants that level of certainty. Prefer formulations such as "the audio suggests", "the musical evidence indicates", "this supports the interpretation that", or "the piece is better characterized as". The answer should sound confident but should not imply stronger certainty than the evidence allows.
 
 Output format:
 Return only valid JSON as one object:
