@@ -230,31 +230,75 @@ def load_local_qwen(args):
     return model, tokenizer
 
 
-def load_local_qwen(args):
+def call_local_qwen(model, tokenizer, args, prompt):
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from transformers.generation.logits_process import LogitsProcessor, LogitsProcessorList
 
-    dtype_map = {
-        "auto": "auto",
-        "bfloat16": torch.bfloat16,
-        "float16": torch.float16,
-        "float32": torch.float32,
-    }
-    model_kwargs = {
-        "torch_dtype": dtype_map[args.torch_dtype],
-        "device_map": args.device_map,
-        "trust_remote_code": args.trust_remote_code,
-    }
-    if args.attn_implementation:
-        model_kwargs["attn_implementation"] = args.attn_implementation
+    class GeneratedPresencePenaltyLogitsProcessor(LogitsProcessor):
+        def __init__(self, penalty, prompt_length):
+            self.penalty = float(penalty)
+            self.prompt_length = int(prompt_length)
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.model_path,
-        trust_remote_code=args.trust_remote_code,
-    )
-    model = AutoModelForCausalLM.from_pretrained(args.model_path, **model_kwargs)
-    model.eval()
-    return model, tokenizer
+        def __call__(self, input_ids, scores):
+            if self.penalty == 0 or input_ids.shape[-1] <= self.prompt_length:
+                return scores
+            generated_ids = input_ids[:, self.prompt_length :]
+            for batch_idx, token_ids in enumerate(generated_ids):
+                scores[batch_idx, token_ids.unique()] -= self.penalty
+            return scores
+
+    messages = [{"role": "user", "content": prompt}]
+    try:
+        inputs = tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_tensors="pt",
+            return_dict=True,
+            enable_thinking=False,
+        )
+    except TypeError:
+        inputs = tokenizer.apply_chat_template(
+            messages,
+            tokenize=True,
+            add_generation_prompt=True,
+            return_tensors="pt",
+            return_dict=True,
+        )
+
+    device = model.device if hasattr(model, "device") else next(model.parameters()).device
+    inputs = inputs.to(device)
+    if isinstance(inputs, dict):
+        input_ids = inputs["input_ids"]
+        generate_inputs = inputs
+    else:
+        input_ids = inputs
+        generate_inputs = {"input_ids": inputs}
+    prompt_length = input_ids.shape[-1]
+
+    generation_kwargs = {
+        "max_new_tokens": args.max_tokens,
+        "do_sample": args.do_sample,
+        "pad_token_id": tokenizer.eos_token_id,
+        "repetition_penalty": args.repetition_penalty,
+    }
+    if args.do_sample:
+        generation_kwargs.update({
+            "temperature": args.temperature,
+            "top_p": args.top_p,
+            "top_k": args.top_k,
+        })
+        if args.min_p > 0:
+            generation_kwargs["min_p"] = args.min_p
+    if args.presence_penalty != 0:
+        generation_kwargs["logits_processor"] = LogitsProcessorList([
+            GeneratedPresencePenaltyLogitsProcessor(args.presence_penalty, prompt_length)
+        ])
+
+    with torch.inference_mode():
+        output_ids = model.generate(**generate_inputs, **generation_kwargs)
+    generated_ids = output_ids[0, prompt_length:]
+    return tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
 
 
 def build_qa_salmonn_item(source_item, qa):
