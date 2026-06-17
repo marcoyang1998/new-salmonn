@@ -232,49 +232,16 @@ def load_local_qwen(args):
 
 def call_local_qwen(model, tokenizer, args, prompt):
     import torch
-    from transformers.generation.logits_process import LogitsProcessor, LogitsProcessorList
-
-    class GeneratedPresencePenaltyLogitsProcessor(LogitsProcessor):
-        def __init__(self, penalty, prompt_length):
-            self.penalty = float(penalty)
-            self.prompt_length = int(prompt_length)
-
-        def __call__(self, input_ids, scores):
-            if self.penalty == 0 or input_ids.shape[-1] <= self.prompt_length:
-                return scores
-            generated_ids = input_ids[:, self.prompt_length :]
-            for batch_idx, token_ids in enumerate(generated_ids):
-                scores[batch_idx, token_ids.unique()] -= self.penalty
-            return scores
 
     messages = [{"role": "user", "content": prompt}]
-    try:
-        inputs = tokenizer.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_tensors="pt",
-            return_dict=True,
-            enable_thinking=False,
-        )
-    except TypeError:
-        inputs = tokenizer.apply_chat_template(
-            messages,
-            tokenize=True,
-            add_generation_prompt=True,
-            return_tensors="pt",
-            return_dict=True,
-        )
+    text = tokenizer.apply_chat_template(
+        messages,
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
 
-    device = model.device if hasattr(model, "device") else next(model.parameters()).device
-    inputs = inputs.to(device)
-    if isinstance(inputs, dict):
-        input_ids = inputs["input_ids"]
-        generate_inputs = inputs
-    else:
-        input_ids = inputs
-        generate_inputs = {"input_ids": inputs}
-    prompt_length = input_ids.shape[-1]
+    inputs = tokenizer([text], return_tensors="pt").to(model.device)
 
     generation_kwargs = {
         "max_new_tokens": args.max_tokens,
@@ -290,15 +257,11 @@ def call_local_qwen(model, tokenizer, args, prompt):
         })
         if args.min_p > 0:
             generation_kwargs["min_p"] = args.min_p
-    if args.presence_penalty != 0:
-        generation_kwargs["logits_processor"] = LogitsProcessorList([
-            GeneratedPresencePenaltyLogitsProcessor(args.presence_penalty, prompt_length)
-        ])
 
     with torch.inference_mode():
-        output_ids = model.generate(**generate_inputs, **generation_kwargs)
-    generated_ids = output_ids[0, prompt_length:]
-    return tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+        output_ids = model.generate(**inputs, **generation_kwargs)
+    generated_ids = output_ids[:, inputs.input_ids.shape[-1]:]
+    return tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
 
 
 def build_qa_salmonn_item(source_item, qa):
