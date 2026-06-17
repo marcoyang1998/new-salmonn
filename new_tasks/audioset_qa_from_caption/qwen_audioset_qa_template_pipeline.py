@@ -163,20 +163,45 @@ def parse_args():
 
 
 def stream_salmonn_items(path, limit=0):
+    decoder = json.JSONDecoder()
+    chunk_size = 1024 * 1024
+    buffer = ""
+    found_array = False
     count = 0
+
     with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line in ('{"data":[', '{"data": [', "]}", "]}"):
-                continue
-            if line.endswith(","):
-                line = line[:-1]
-            if not line or line in ("]", "}"):
-                continue
-            yield count, json.loads(line)
-            count += 1
-            if limit and count >= limit:
+        while not found_array:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                raise ValueError(f"Could not find top-level data array in {path}")
+            buffer += chunk
+            start = buffer.find("[")
+            if start != -1:
+                buffer = buffer[start + 1 :]
+                found_array = True
+
+        while True:
+            buffer = buffer.lstrip()
+            if buffer.startswith("]"):
                 return
+            if buffer.startswith(","):
+                buffer = buffer[1:]
+                continue
+
+            while True:
+                try:
+                    item, end = decoder.raw_decode(buffer)
+                    yield count, item
+                    count += 1
+                    if limit and count >= limit:
+                        return
+                    buffer = buffer[end:]
+                    break
+                except json.JSONDecodeError:
+                    chunk = f.read(chunk_size)
+                    if not chunk:
+                        raise
+                    buffer += chunk
 
 
 def iter_shard_items(path, num_shards=1, shard_id=0, limit=0):
