@@ -185,6 +185,12 @@ def parse_args():
     parser.add_argument("--trust-remote-code", action="store_true", help="Pass trust_remote_code=True when loading the local model/tokenizer.")
     parser.add_argument("--max-retries", type=int, default=3)
     parser.add_argument("--retry-sleep", type=float, default=2.0)
+    parser.add_argument(
+        "--sample-batch-size",
+        type=int,
+        default=1,
+        help="Number of source samples to accumulate before one batched local generation call.",
+    )
     parser.add_argument("--debug", action="store_true", help="Only process the first 5 input samples.")
     parser.add_argument("--limit", type=int, default=0, help="Optional positive sample limit. Overrides --debug if set.")
     parser.add_argument("--finalize-only", action="store_true", help="Only convert the checkpoint JSONL to final SALMONN JSON.")
@@ -314,8 +320,213 @@ def generate_template_batch(generator, args, prompts, templates, source_index):
     return None, template_errors
 
 
+def build_source_job(source_item, source_index, args):
+    caption = get_caption(source_item, source_index)
+    selected_templates = sample_templates(caption, source_index, args.num_qa, args.seed)
+    prompts = [build_template_prompt(caption, template) for template in selected_templates]
+    return {
+        "source_index": source_index,
+        "source_item": source_item,
+        "selected_templates": selected_templates,
+        "prompts": prompts,
+    }
+
+
+def generate_source_batch(generator, args, jobs):
+    prompt_entries = []
+    for job in jobs:
+        for template, prompt in zip(job["selected_templates"], job["prompts"]):
+            prompt_entries.append({
+                "source_index": job["source_index"],
+                "template": template,
+                "prompt": prompt,
+            })
+
+    if not prompt_entries:
+        return {}, []
+
+    source_ids = ",".join(str(job["source_index"]) for job in jobs)
+    last_error = None
+    for attempt in range(1, args.max_retries + 1):
+        try:
+            raw_texts = generate_many(
+                generator,
+                args,
+                [entry["prompt"] for entry in prompt_entries],
+            )
+            if len(raw_texts) != len(prompt_entries):
+                raise ValueError(f"Expected {len(prompt_entries)} batch outputs, got {len(raw_texts)}.")
+
+            grouped_qas = {job["source_index"]: [] for job in jobs}
+            for entry, raw_text in zip(prompt_entries, raw_texts):
+                qa = parse_single_qa_response(raw_text)
+                grouped_qas[entry["source_index"]].append((entry["template"], qa))
+            return grouped_qas, []
+        except Exception as exc:
+            last_error = exc
+            log_message(
+                f"source_batch={source_ids} prompts={len(prompt_entries)} "
+                f"attempt={attempt}/{args.max_retries} failed: {repr(exc)}",
+                level="WARN",
+            )
+            print(traceback.format_exc(), flush=True)
+            if attempt < args.max_retries:
+                time.sleep(args.retry_sleep * attempt)
+
+    errors = [
+        {
+            "source_index": entry["source_index"],
+            "template_id": entry["template"]["id"],
+            "error": repr(last_error),
+            "source_batch_failed": True,
+        }
+        for entry in prompt_entries
+    ]
+    return None, errors
+
+
+def process_one_source(generator, args, job):
+    source_index = job["source_index"]
+    source_item = job["source_item"]
+    selected_templates = job["selected_templates"]
+    prompts = job["prompts"]
+    qa_items = []
+    succeeded_template_ids = []
+    template_errors = []
+
+    qas, batch_errors = generate_template_batch(
+        generator,
+        args,
+        prompts,
+        selected_templates,
+        source_index,
+    )
+
+    if qas is not None:
+        for template, qa in zip(selected_templates, qas):
+            qa_items.append(build_qa_salmonn_item(source_item, qa))
+            succeeded_template_ids.append(template["id"])
+        return qa_items, succeeded_template_ids, template_errors
+
+    template_errors.extend(batch_errors)
+    log_message(
+        f"source={source_index} falling back to per-template generation",
+        level="WARN",
+    )
+    for template, prompt in zip(selected_templates, prompts):
+        last_error = None
+        for attempt in range(1, args.max_retries + 1):
+            try:
+                raw_text = generate_one(generator, args, prompt)
+                qa = parse_single_qa_response(raw_text)
+                item = build_qa_salmonn_item(source_item, qa)
+                qa_items.append(item)
+                succeeded_template_ids.append(template["id"])
+                break
+            except Exception as exc:
+                last_error = exc
+                log_message(
+                    f"source={source_index} template={template['id']} "
+                    f"attempt={attempt}/{args.max_retries} failed: {repr(exc)}",
+                    level="WARN",
+                )
+                print(traceback.format_exc(), flush=True)
+                if attempt < args.max_retries:
+                    time.sleep(args.retry_sleep * attempt)
+        else:
+            template_errors.append({
+                "template_id": template["id"],
+                "error": repr(last_error),
+            })
+    return qa_items, succeeded_template_ids, template_errors
+
+
+def write_job_result(tmp_f, failed_path, job, qa_items, succeeded_template_ids, template_errors, total_count):
+    source_index = job["source_index"]
+    selected_templates = job["selected_templates"]
+    if qa_items:
+        record = {
+            "source_index": source_index,
+            "template_ids": succeeded_template_ids,
+            "qa_items": qa_items,
+            "template_errors": template_errors,
+        }
+        tmp_f.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+        tmp_f.flush()
+        log_message(
+            f"source={source_index} progress={source_index + 1}/{total_count} "
+            f"generated={len(qa_items)} selected_templates={len(selected_templates)} "
+            f"template_ids={','.join(succeeded_template_ids)}"
+        )
+    else:
+        append_failed_record(
+            failed_path,
+            {
+                "source_index": source_index,
+                "selected_template_ids": [template["id"] for template in selected_templates],
+                "template_errors": template_errors,
+            },
+        )
+        log_message(
+            f"Skipping source index {source_index}; all selected templates failed. "
+            f"Logged to {failed_path}",
+            level="ERROR",
+        )
+
+
+def process_source_jobs(generator, args, jobs, tmp_f, failed_path, total_count):
+    grouped_qas, batch_errors = generate_source_batch(generator, args, jobs)
+    batch_errors_by_source = {}
+    for error in batch_errors:
+        batch_errors_by_source.setdefault(error["source_index"], []).append(error)
+
+    if grouped_qas is None:
+        log_message(
+            f"source_batch={','.join(str(job['source_index']) for job in jobs)} "
+            "falling back to per-source generation",
+            level="WARN",
+        )
+        for job in jobs:
+            qa_items, succeeded_template_ids, template_errors = process_one_source(generator, args, job)
+            template_errors = batch_errors_by_source.get(job["source_index"], []) + template_errors
+            write_job_result(
+                tmp_f,
+                failed_path,
+                job,
+                qa_items,
+                succeeded_template_ids,
+                template_errors,
+                total_count,
+            )
+        return
+
+    for job in jobs:
+        source_item = job["source_item"]
+        template_qa_pairs = grouped_qas[job["source_index"]]
+        qa_items = [
+            build_qa_salmonn_item(source_item, qa)
+            for _, qa in template_qa_pairs
+        ]
+        succeeded_template_ids = [
+            template["id"]
+            for template, _ in template_qa_pairs
+        ]
+        write_job_result(
+            tmp_f,
+            failed_path,
+            job,
+            qa_items,
+            succeeded_template_ids,
+            [],
+            total_count,
+        )
+
+
 def main():
     args = parse_args()
+    if args.sample_batch_size < 1:
+        raise ValueError("--sample-batch-size must be at least 1.")
+
     input_path = Path(args.input)
     output_path = Path(args.output)
     tmp_path = Path(args.tmp_output) if args.tmp_output else Path(str(output_path) + ".tmp.jsonl")
@@ -336,88 +547,18 @@ def main():
     checkpoint = load_checkpoint(tmp_path)
 
     with tmp_path.open("a", encoding="utf-8") as tmp_f:
+        pending_jobs = []
         for source_index, source_item in enumerate(data):
             if source_index in checkpoint:
                 continue
 
-            caption = get_caption(source_item, source_index)
-            selected_templates = sample_templates(caption, source_index, args.num_qa, args.seed)
-            qa_items = []
-            succeeded_template_ids = []
-            template_errors = []
-            prompts = [build_template_prompt(caption, template) for template in selected_templates]
-            qas, batch_errors = generate_template_batch(
-                generator,
-                args,
-                prompts,
-                selected_templates,
-                source_index,
-            )
+            pending_jobs.append(build_source_job(source_item, source_index, args))
+            if len(pending_jobs) >= args.sample_batch_size:
+                process_source_jobs(generator, args, pending_jobs, tmp_f, failed_path, len(data))
+                pending_jobs = []
 
-            if qas is not None:
-                for template, qa in zip(selected_templates, qas):
-                    qa_items.append(build_qa_salmonn_item(source_item, qa))
-                    succeeded_template_ids.append(template["id"])
-            else:
-                template_errors.extend(batch_errors)
-                log_message(
-                    f"[WARN] source={source_index} falling back to per-template generation",
-                    level="WARN",
-                )
-                for template, prompt in zip(selected_templates, prompts):
-                    last_error = None
-                    for attempt in range(1, args.max_retries + 1):
-                        try:
-                            raw_text = generate_one(generator, args, prompt)
-                            qa = parse_single_qa_response(raw_text)
-                            item = build_qa_salmonn_item(source_item, qa)
-                            qa_items.append(item)
-                            succeeded_template_ids.append(template["id"])
-                            break
-                        except Exception as exc:
-                            last_error = exc
-                            log_message(
-                                f"[WARN] source={source_index} template={template['id']} "
-                                f"attempt={attempt}/{args.max_retries} failed: {repr(exc)}",
-                                level="WARN",
-                            )
-                            print(traceback.format_exc(), flush=True)
-                            if attempt < args.max_retries:
-                                time.sleep(args.retry_sleep * attempt)
-                    else:
-                        template_errors.append({
-                            "template_id": template["id"],
-                            "error": repr(last_error),
-                        })
-
-            if qa_items:
-                record = {
-                    "source_index": source_index,
-                    "template_ids": succeeded_template_ids,
-                    "qa_items": qa_items,
-                    "template_errors": template_errors,
-                }
-                tmp_f.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
-                tmp_f.flush()
-                log_message(
-                    f"source={source_index} progress={source_index + 1}/{len(data)} "
-                    f"generated={len(qa_items)} selected_templates={len(selected_templates)} "
-                    f"template_ids={','.join(succeeded_template_ids)}"
-                )
-            else:
-                append_failed_record(
-                    failed_path,
-                    {
-                        "source_index": source_index,
-                        "selected_template_ids": [template["id"] for template in selected_templates],
-                        "template_errors": template_errors,
-                    },
-                )
-                log_message(
-                    f"[ERROR] Skipping source index {source_index}; all selected templates failed. "
-                    f"Logged to {failed_path}",
-                    level="ERROR",
-                )
+        if pending_jobs:
+            process_source_jobs(generator, args, pending_jobs, tmp_f, failed_path, len(data))
 
     total, missing = finalize_output(tmp_path, output_path, len(data))
     log_message(f"Wrote {total} QA training items to {output_path}; missing/skipped source items: {missing}")
