@@ -1,5 +1,4 @@
 import argparse
-import json
 from pathlib import Path
 
 
@@ -9,45 +8,70 @@ def parse_args():
     parser.add_argument("--output-dir", required=True, help="Directory where chunk JSON files will be written.")
     parser.add_argument("--prefix", default="chunk", help="Chunk filename prefix.")
     parser.add_argument("--num-chunks", type=int, required=True, help="Number of chunks to create.")
+    parser.add_argument("--progress-every", type=int, default=10000, help="Print progress after this many input items.")
     return parser.parse_args()
 
 
-def iter_json_array_items(path):
-    decoder = json.JSONDecoder()
-    chunk_size = 1024 * 1024
-    buffer = ""
+def iter_json_array_item_strings(path):
+    chunk_size = 4 * 1024 * 1024
     found_array = False
+    collecting = False
+    in_string = False
+    escape = False
+    depth = 0
+    item_parts = []
 
     with open(path, "r", encoding="utf-8") as f:
-        while not found_array:
+        while True:
             chunk = f.read(chunk_size)
             if not chunk:
-                raise ValueError(f"Could not find top-level data array in {path}")
-            buffer += chunk
-            start = buffer.find("[")
-            if start != -1:
-                buffer = buffer[start + 1 :]
-                found_array = True
-
-        while True:
-            buffer = buffer.lstrip()
-            if buffer.startswith("]"):
+                if collecting:
+                    raise ValueError(f"Unexpected EOF while reading an item from {path}")
                 return
-            if buffer.startswith(","):
-                buffer = buffer[1:]
-                continue
 
-            while True:
-                try:
-                    item, end = decoder.raw_decode(buffer)
-                    yield item
-                    buffer = buffer[end:]
-                    break
-                except json.JSONDecodeError:
-                    chunk = f.read(chunk_size)
-                    if not chunk:
-                        raise
-                    buffer += chunk
+            pos = 0
+            if not found_array:
+                start = chunk.find("[")
+                if start == -1:
+                    continue
+                found_array = True
+                pos = start + 1
+
+            for char in chunk[pos:]:
+                if not collecting:
+                    if char.isspace() or char == ",":
+                        continue
+                    if char == "]":
+                        return
+                    if char != "{":
+                        raise ValueError(f"Expected object item in top-level data array, got {char!r}")
+                    collecting = True
+                    in_string = False
+                    escape = False
+                    depth = 1
+                    item_parts = ["{"]
+                    continue
+
+                item_parts.append(char)
+                if in_string:
+                    if escape:
+                        escape = False
+                    elif char == "\\":
+                        escape = True
+                    elif char == '"':
+                        in_string = False
+                    continue
+
+                if char == '"':
+                    in_string = True
+                elif char == "{":
+                    depth += 1
+                elif char == "}":
+                    depth -= 1
+                    if depth == 0:
+                        yield "".join(item_parts)
+                        collecting = False
+                        item_parts = []
 
 
 def write_chunk_header(files):
@@ -77,12 +101,17 @@ def main():
 
     try:
         write_chunk_header(files)
-        for index, item in enumerate(iter_json_array_items(args.input)):
+        for index, item_text in enumerate(iter_json_array_item_strings(args.input)):
             rank = index % args.num_chunks
             if counts[rank] > 0:
                 files[rank].write(",\n")
-            files[rank].write(json.dumps(item, ensure_ascii=False, separators=(", ", ": ")))
+            files[rank].write(item_text)
             counts[rank] += 1
+            if counts[rank] % 100 == 0:
+                files[rank].flush()
+            total = index + 1
+            if args.progress_every > 0 and total % args.progress_every == 0:
+                print(f"processed {total} items", flush=True)
         write_chunk_footer(files)
     finally:
         for f in files:
