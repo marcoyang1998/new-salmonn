@@ -1,9 +1,11 @@
 import argparse
 import json
+import os
 import random
 import re
 import time
 import traceback
+from datetime import datetime
 from pathlib import Path
 
 
@@ -11,7 +13,41 @@ DEFAULT_INPUT = "salmonn_data_v1.1/changli_data/Audioset_Qwen3OmniCap_train_filt
 DEFAULT_OUTPUT = "salmonn_data_v1.1/stage2/audioset_qwen3.5_35b_a3b_template_qa.json"
 DEFAULT_MODEL = "Qwen3.5-35B-A3B"
 DEFAULT_MODEL_PATH = "/mnt/shared-storage-gpfs2/gpfs2-shared-public/huggingface/hub/models--Qwen--Qwen3.5-35B-A3B/snapshots/ec2d4ece1ffb563322cbee9a48fe0e3fcbce0307"
-DEFAULT_NUM_QA = 3
+DEFAULT_NUM_QA = 2
+LEAKAGE_PATTERNS = [
+    r"\bcaption\b",
+    r"\bdescription\b",
+    r"\btext description\b",
+    r"\bprovided text\b",
+    r"\bprovided information\b",
+    r"\bsource text\b",
+    r"\bprompt\b",
+    r"\bmentions?\b",
+    r"\bmentioned\b",
+    r"\bas stated\b",
+    r"\bthe text\b",
+    r"\bthe source\b",
+    r"\baccording to\b",
+]
+
+
+def current_timestamp():
+    return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S%z")
+
+
+def get_rank_id():
+    for key in ("RANK_ID", "RANK", "LOCAL_RANK", "SLURM_PROCID"):
+        value = os.environ.get(key)
+        if value is not None and value != "":
+            return value
+    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if cuda_visible_devices:
+        return f"gpu:{cuda_visible_devices}"
+    return "main"
+
+
+def log_message(message, level="INFO"):
+    print(f"[{current_timestamp()}][rank {get_rank_id()}][{level}] {message}", flush=True)
 
 
 META_QA_TEMPLATES = [
@@ -70,7 +106,7 @@ META_QA_TEMPLATES = [
     {
         "id": "negative_evidence_rule_out",
         "name": "Negative evidence / rule-out",
-        "instruction": "Generate one QA pair that asks what is absent or not supported by the audio, and how that absence helps rule out another interpretation. Only use absences explicitly stated in the description.",
+        "instruction": "Generate one QA pair that asks what is absent or not supported by the audio, and how that absence helps rule out another interpretation. Only use absences that are directly supported by the audible evidence.",
         "required_any": [
             [r"\b(no |without|lacks?|absent|absence|no evidence|not present|does not|do not|none|free from|void of|only|sole|single|entirely)\b"],
         ],
@@ -103,7 +139,7 @@ Requirements for the question:
 2. The question should sound as if it is being asked about the audio itself, not about a caption or text.
 3. The question should be analytical and require synthesizing multiple audible cues, not a simple sound-label lookup.
 4. The question must stay within the specialized focus above.
-5. Prefer multi-cue formulations such as "Considering...", "By analyzing...", "Given...", or "Based on..." when natural.
+5. Vary the question starter naturally. Avoid copying the same opening pattern across many generations. Prefer concise evidence-seeking or inference-based openings such as "Which cues indicate...", "Why is this better characterized as...", "Based on the audio...", "Given the interplay between...", or "What can be inferred from..." when they fit the specialized focus.
 6. Do not ask about unsupported facts such as exact identities, exact locations, recording equipment models, speaker names, or external cultural details unless explicitly stated.
 
 Requirements for the answer:
@@ -113,6 +149,7 @@ Requirements for the answer:
 4. Do not introduce new facts beyond the description.
 5. Do not mention that the answer is based on a caption or text description. Write as if the evidence comes from the audio.
 6. Use cautious, evidence-grounded language. Avoid overclaiming beyond the provided description. In particular, do not use overly definitive words such as "clearly", "obviously", "definitively", "undoubtedly", or "explicitly proves" unless the description directly warrants that level of certainty. Prefer formulations such as "the audio suggests", "the acoustic evidence indicates", "this supports the interpretation that", or "the recording is better characterized as". The answer should sound confident but should not imply stronger certainty than the evidence allows.
+7. Never refer to the input as a caption, description, prompt, source text, or provided text. Avoid phrases like "the description says", "the description notes", "the text states", "the audio mentions", "as stated", or "according to the provided information". Present all evidence as audible acoustic evidence.
 
 Output format:
 Return only valid JSON as one object:
@@ -137,7 +174,7 @@ def parse_args():
     parser.add_argument("--api-key", default="", help="API key for OpenAI-compatible backend.")
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Qwen model name exposed by the endpoint.")
     parser.add_argument("--model-path", default=DEFAULT_MODEL_PATH, help="Local Qwen model path or Hugging Face model id.")
-    parser.add_argument("--num-qa", type=int, default=3, help="Maximum number of applicable templates sampled per item.")
+    parser.add_argument("--num-qa", type=int, default=DEFAULT_NUM_QA, help="Maximum number of applicable templates sampled per item.")
     parser.add_argument("--seed", type=int, default=20260618, help="Seed for deterministic template sampling.")
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--max-tokens", type=int, default=2048, help="Maximum generated tokens for either backend.")
@@ -152,7 +189,13 @@ def parse_args():
     parser.add_argument("--attn-implementation", default="", help="Optional local attention implementation, e.g. flash_attention_2 or sdpa.")
     parser.add_argument("--trust-remote-code", action="store_true", help="Pass trust_remote_code=True when loading the local model/tokenizer.")
     parser.add_argument("--max-retries", type=int, default=3)
-    parser.add_argument("--retry-sleep", type=float, default=2.0)
+    parser.add_argument("--retry-sleep", type=float, default=0.0)
+    parser.add_argument(
+        "--sample-batch-size",
+        type=int,
+        default=1,
+        help="Number of source samples to accumulate before one batched local generation call.",
+    )
     parser.add_argument("--num-shards", type=int, default=1, help="Total number of logical data shards.")
     parser.add_argument("--shard-id", type=int, default=0, help="This worker's logical shard id in [0, num_shards).")
     parser.add_argument("--debug", action="store_true", help="Only process the first 5 input samples.")
@@ -273,6 +316,13 @@ def strip_markdown_fence(text):
     return text.strip()
 
 
+def find_leakage(text):
+    for pattern in LEAKAGE_PATTERNS:
+        if re.search(pattern, text, flags=re.IGNORECASE):
+            return pattern
+    return None
+
+
 def parse_single_qa_response(text):
     text = strip_markdown_fence(text)
     try:
@@ -297,6 +347,12 @@ def parse_single_qa_response(text):
         raise ValueError("Generated QA has an empty question or answer.")
     if not question.startswith("<audio>"):
         question = "<audio>" + question.lstrip()
+    else:
+        question = "<audio>" + question[len("<audio>"):].lstrip()
+
+    leakage_pattern = find_leakage(f"{question}\n{answer}")
+    if leakage_pattern:
+        raise ValueError(f"Generated QA leaks meta-input wording matching {leakage_pattern!r}.")
     return {"question": question, "answer": answer}
 
 
@@ -395,6 +451,58 @@ def call_local_qwen(model, tokenizer, args, prompt):
     return tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
 
 
+def call_local_qwen_batch(model, tokenizer, args, prompts):
+    import torch
+
+    if not prompts:
+        return []
+
+    texts = []
+    for prompt in prompts:
+        messages = [{"role": "user", "content": prompt}]
+        texts.append(
+            tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+        )
+
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    original_padding_side = tokenizer.padding_side
+    tokenizer.padding_side = "left"
+    try:
+        inputs = tokenizer(texts, return_tensors="pt", padding=True).to(model.device)
+    finally:
+        tokenizer.padding_side = original_padding_side
+
+    generation_kwargs = {
+        "max_new_tokens": args.max_tokens,
+        "do_sample": args.do_sample,
+        "pad_token_id": tokenizer.pad_token_id,
+        "repetition_penalty": args.repetition_penalty,
+    }
+    if args.do_sample:
+        generation_kwargs.update({
+            "temperature": args.temperature,
+            "top_p": args.top_p,
+            "top_k": args.top_k,
+        })
+        if args.min_p > 0:
+            generation_kwargs["min_p"] = args.min_p
+
+    with torch.inference_mode():
+        output_ids = model.generate(**inputs, **generation_kwargs)
+    generated_ids = output_ids[:, inputs.input_ids.shape[-1]:]
+    return [
+        text.strip()
+        for text in tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+    ]
+
+
 def call_qwen(client, args, prompt):
     response = client.chat.completions.create(
         model=args.model,
@@ -421,6 +529,236 @@ def generate_one(generator, args, prompt):
         return call_qwen(generator, args, prompt)
     model, tokenizer = generator
     return call_local_qwen(model, tokenizer, args, prompt)
+
+
+def generate_many(generator, args, prompts):
+    if args.backend == "openai":
+        return [call_qwen(generator, args, prompt) for prompt in prompts]
+    model, tokenizer = generator
+    return call_local_qwen_batch(model, tokenizer, args, prompts)
+
+
+def generate_template_batch(generator, args, prompts, templates, source_index):
+    last_error = None
+    for attempt in range(1, args.max_retries + 1):
+        try:
+            raw_texts = generate_many(generator, args, prompts)
+            if len(raw_texts) != len(prompts):
+                raise ValueError(f"Expected {len(prompts)} batch outputs, got {len(raw_texts)}.")
+            qas = [parse_single_qa_response(raw_text) for raw_text in raw_texts]
+            return qas, []
+        except Exception as exc:
+            last_error = exc
+            log_message(
+                f"source={source_index} batched generation "
+                f"attempt={attempt}/{args.max_retries} failed: {repr(exc)}",
+                level="WARN",
+            )
+            print(traceback.format_exc(), flush=True)
+            if attempt < args.max_retries and args.retry_sleep > 0:
+                time.sleep(args.retry_sleep * attempt)
+
+    template_errors = [
+        {
+            "template_id": template["id"],
+            "error": repr(last_error),
+            "batch_failed": True,
+        }
+        for template in templates
+    ]
+    return None, template_errors
+
+
+def build_source_job(source_item, source_index, args):
+    caption = get_caption(source_item, source_index)
+    selected_templates = sample_templates(caption, source_index, args.num_qa, args.seed)
+    prompts = [build_template_prompt(caption, template) for template in selected_templates]
+    return {
+        "source_index": source_index,
+        "source_item": source_item,
+        "selected_templates": selected_templates,
+        "prompts": prompts,
+    }
+
+
+def generate_source_batch(generator, args, jobs):
+    prompt_entries = []
+    for job in jobs:
+        for template, prompt in zip(job["selected_templates"], job["prompts"]):
+            prompt_entries.append({
+                "source_index": job["source_index"],
+                "template": template,
+                "prompt": prompt,
+            })
+
+    if not prompt_entries:
+        return {}, []
+
+    source_ids = ",".join(str(job["source_index"]) for job in jobs)
+    last_error = None
+    for attempt in range(1, args.max_retries + 1):
+        try:
+            raw_texts = generate_many(
+                generator,
+                args,
+                [entry["prompt"] for entry in prompt_entries],
+            )
+            if len(raw_texts) != len(prompt_entries):
+                raise ValueError(f"Expected {len(prompt_entries)} batch outputs, got {len(raw_texts)}.")
+
+            grouped_qas = {job["source_index"]: [] for job in jobs}
+            for entry, raw_text in zip(prompt_entries, raw_texts):
+                qa = parse_single_qa_response(raw_text)
+                grouped_qas[entry["source_index"]].append((entry["template"], qa))
+            return grouped_qas, []
+        except Exception as exc:
+            last_error = exc
+            log_message(
+                f"source_batch={source_ids} prompts={len(prompt_entries)} "
+                f"attempt={attempt}/{args.max_retries} failed: {repr(exc)}",
+                level="WARN",
+            )
+            print(traceback.format_exc(), flush=True)
+            if attempt < args.max_retries and args.retry_sleep > 0:
+                time.sleep(args.retry_sleep * attempt)
+
+    errors = [
+        {
+            "source_index": entry["source_index"],
+            "template_id": entry["template"]["id"],
+            "error": repr(last_error),
+            "source_batch_failed": True,
+        }
+        for entry in prompt_entries
+    ]
+    return None, errors
+
+
+def process_one_source(generator, args, job):
+    source_index = job["source_index"]
+    source_item = job["source_item"]
+    selected_templates = job["selected_templates"]
+    prompts = job["prompts"]
+    qa_items = []
+    succeeded_template_ids = []
+    template_errors = []
+
+    qas, batch_errors = generate_template_batch(
+        generator,
+        args,
+        prompts,
+        selected_templates,
+        source_index,
+    )
+
+    if qas is not None:
+        for template, qa in zip(selected_templates, qas):
+            qa_items.append(build_qa_salmonn_item(source_item, qa))
+            succeeded_template_ids.append(template["id"])
+        return qa_items, succeeded_template_ids, template_errors
+
+    template_errors.extend(batch_errors)
+    log_message(
+        f"source={source_index} falling back to per-template generation",
+        level="WARN",
+    )
+    for template, prompt in zip(selected_templates, prompts):
+        last_error = None
+        for attempt in range(1, args.max_retries + 1):
+            try:
+                raw_text = generate_one(generator, args, prompt)
+                qa = parse_single_qa_response(raw_text)
+                qa_items.append(build_qa_salmonn_item(source_item, qa))
+                succeeded_template_ids.append(template["id"])
+                break
+            except Exception as exc:
+                last_error = exc
+                log_message(
+                    f"source={source_index} template={template['id']} "
+                    f"attempt={attempt}/{args.max_retries} failed: {repr(exc)}",
+                    level="WARN",
+                )
+                print(traceback.format_exc(), flush=True)
+                if attempt < args.max_retries and args.retry_sleep > 0:
+                    time.sleep(args.retry_sleep * attempt)
+        else:
+            template_errors.append({
+                "template_id": template["id"],
+                "error": repr(last_error),
+            })
+    return qa_items, succeeded_template_ids, template_errors
+
+
+def write_job_result(tmp_path, failed_path, job, qa_items, succeeded_template_ids, template_errors):
+    source_index = job["source_index"]
+    selected_templates = job["selected_templates"]
+    if qa_items:
+        append_jsonl(
+            tmp_path,
+            {
+                "source_index": source_index,
+                "template_ids": succeeded_template_ids,
+                "qa_items": qa_items,
+                "template_errors": template_errors,
+            },
+        )
+        log_message(
+            f"source={source_index} generated={len(qa_items)} "
+            f"selected_templates={len(selected_templates)} "
+            f"template_ids={','.join(succeeded_template_ids)}"
+        )
+        return True
+
+    append_jsonl(
+        failed_path,
+        {
+            "source_index": source_index,
+            "selected_template_ids": [template["id"] for template in selected_templates],
+            "template_errors": template_errors,
+        },
+    )
+    log_message(
+        f"Skipping source index {source_index}; all selected templates failed. "
+        f"Logged to {failed_path}",
+        level="ERROR",
+    )
+    return False
+
+
+def process_source_jobs(generator, args, jobs, tmp_path, failed_path):
+    grouped_qas, batch_errors = generate_source_batch(generator, args, jobs)
+    batch_errors_by_source = {}
+    for error in batch_errors:
+        batch_errors_by_source.setdefault(error["source_index"], []).append(error)
+
+    completed = []
+    if grouped_qas is None:
+        log_message(
+            f"source_batch={','.join(str(job['source_index']) for job in jobs)} "
+            "falling back to per-source generation",
+            level="WARN",
+        )
+        for job in jobs:
+            qa_items, succeeded_template_ids, template_errors = process_one_source(generator, args, job)
+            template_errors = batch_errors_by_source.get(job["source_index"], []) + template_errors
+            if write_job_result(tmp_path, failed_path, job, qa_items, succeeded_template_ids, template_errors):
+                completed.append(job["source_index"])
+        return completed
+
+    for job in jobs:
+        source_item = job["source_item"]
+        template_qa_pairs = grouped_qas[job["source_index"]]
+        qa_items = [
+            build_qa_salmonn_item(source_item, qa)
+            for _, qa in template_qa_pairs
+        ]
+        succeeded_template_ids = [
+            template["id"]
+            for template, _ in template_qa_pairs
+        ]
+        if write_job_result(tmp_path, failed_path, job, qa_items, succeeded_template_ids, []):
+            completed.append(job["source_index"])
+    return completed
 
 
 def write_final_json_from_checkpoint(tmp_path, output_path):
@@ -491,6 +829,8 @@ def main():
         raise ValueError("--num-shards must be >= 1")
     if not 0 <= args.shard_id < args.num_shards:
         raise ValueError("--shard-id must satisfy 0 <= shard_id < num_shards")
+    if args.sample_batch_size < 1:
+        raise ValueError("--sample-batch-size must be at least 1.")
 
     input_path = Path(args.input)
     output_path = Path(args.output)
@@ -505,7 +845,7 @@ def main():
 
     if args.finalize_only:
         total_items, completed_sources = write_final_json_from_checkpoint(tmp_path, output_path)
-        print(f"Wrote {total_items} QA training items from {completed_sources} source items to {output_path}")
+        log_message(f"Wrote {total_items} QA training items from {completed_sources} source items to {output_path}")
         return
 
     generator = load_generator(args)
@@ -513,79 +853,29 @@ def main():
     checkpoint_indices = load_checkpoint_indices(tmp_path)
 
     processed_this_run = 0
+    pending_jobs = []
     for source_index, source_item in iter_shard_items(input_path, args.num_shards, args.shard_id, limit=limit):
         if source_index in checkpoint_indices:
             continue
 
-        caption = get_caption(source_item, source_index)
-        selected_templates = sample_templates(caption, source_index, args.num_qa, args.seed)
-        qa_items = []
-        succeeded_template_ids = []
-        template_errors = []
+        pending_jobs.append(build_source_job(source_item, source_index, args))
+        if len(pending_jobs) >= args.sample_batch_size:
+            completed = process_source_jobs(generator, args, pending_jobs, tmp_path, failed_path)
+            for completed_index in completed:
+                checkpoint_indices.add(completed_index)
+            processed_this_run += len(completed)
+            pending_jobs = []
 
-        for template in selected_templates:
-            prompt = build_template_prompt(caption, template)
-            last_error = None
-            for attempt in range(1, args.max_retries + 1):
-                try:
-                    raw_text = generate_one(generator, args, prompt)
-                    qa = parse_single_qa_response(raw_text)
-                    qa_items.append(build_qa_salmonn_item(source_item, qa))
-                    succeeded_template_ids.append(template["id"])
-                    break
-                except Exception as exc:
-                    last_error = exc
-                    print(
-                        f"[WARN] source={source_index} template={template['id']} "
-                        f"attempt={attempt}/{args.max_retries} failed: {repr(exc)}",
-                        flush=True,
-                    )
-                    print(traceback.format_exc(), flush=True)
-                    if attempt < args.max_retries:
-                        time.sleep(args.retry_sleep * attempt)
-            else:
-                template_errors.append({
-                    "template_id": template["id"],
-                    "error": repr(last_error),
-                })
-
-        if qa_items:
-            append_jsonl(
-                tmp_path,
-                {
-                    "source_index": source_index,
-                    "template_ids": succeeded_template_ids,
-                    "qa_items": qa_items,
-                    "template_errors": template_errors,
-                },
-            )
-            checkpoint_indices.add(source_index)
-            processed_this_run += 1
-            print(
-                f"[{source_index}] generated {len(qa_items)} QA items "
-                f"from {len(selected_templates)} selected templates",
-                flush=True,
-            )
-        else:
-            append_jsonl(
-                failed_path,
-                {
-                    "source_index": source_index,
-                    "selected_template_ids": [template["id"] for template in selected_templates],
-                    "template_errors": template_errors,
-                },
-            )
-            print(
-                f"[ERROR] Skipping source index {source_index}; all selected templates failed. "
-                f"Logged to {failed_path}",
-                flush=True,
-            )
+    if pending_jobs:
+        completed = process_source_jobs(generator, args, pending_jobs, tmp_path, failed_path)
+        for completed_index in completed:
+            checkpoint_indices.add(completed_index)
+        processed_this_run += len(completed)
 
     total_items, completed_sources = write_final_json_from_checkpoint(tmp_path, output_path)
-    print(
+    log_message(
         f"Wrote {total_items} QA training items from {completed_sources} source items to {output_path}; "
         f"processed this run: {processed_this_run}",
-        flush=True,
     )
 
 
