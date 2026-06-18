@@ -36,6 +36,8 @@ LEAKAGE_PATTERNS = [
     r"\bprovided information\b",
     r"\bsource text\b",
     r"\bprompt\b",
+    r"\bmentions?\b",
+    r"\bmentioned\b",
     r"\bas stated\b",
     r"\bthe text\b",
     r"\bthe source\b",
@@ -149,7 +151,7 @@ Requirements for the question:
 3. The question should be analytical and require synthesizing multiple details from the description.
 4. The question must stay within the specialized focus above.
 5. Do not ask about unsupported facts such as exact key, composer, artist, recording venue, microphone placement, specific chord names, or external cultural references unless explicitly stated.
-6. Do not default to "How" questions. Use a balanced variety of question starters across generations, such as "What evidence suggests...", "Why is...", "Which musical cues...", "Based on the audio...", "Given the...", "What can be inferred...", and "What aspects...". Use "How" only when it is the most natural fit for the specialized focus.
+6. Vary the question starter naturally. Do not repeatedly default to either "What" or "How". Prefer a balanced mix across generations, including starters such as "Why is...", "Which musical cues...", "Based on the audio...", "Given the...", "In what way...", "How does...", and occasional "What..." forms. Choose the starter that best fits the specialized focus.
 
 Requirements for the answer:
 1. The answer must be fully supported by the provided description.
@@ -158,7 +160,7 @@ Requirements for the answer:
 4. Do not introduce new facts beyond the description.
 5. Do not mention that the answer is based on a caption or text description. Write as if the evidence comes from the audio.
 6. Use cautious, evidence-grounded language. Avoid overclaiming beyond the provided description. In particular, do not use overly definitive words such as "clearly", "obviously", "definitively", "undoubtedly", or "explicitly proves" unless the description directly warrants that level of certainty. Prefer formulations such as "the audio suggests", "the musical evidence indicates", "this supports the interpretation that", or "the piece is better characterized as". The answer should sound confident but should not imply stronger certainty than the evidence allows.
-7. Never refer to the input as a caption, description, prompt, source text, or provided text. Avoid phrases like "the description says", "the description notes", "the text states", "as stated", or "according to the provided information". Present all evidence as audible musical evidence.
+7. Never refer to the input as a caption, description, prompt, source text, or provided text. Avoid phrases like "the description says", "the description notes", "the text states", "the audio mentions", "as stated", or "according to the provided information". Present all evidence as audible musical evidence.
 
 Output format:
 Return only valid JSON as one object:
