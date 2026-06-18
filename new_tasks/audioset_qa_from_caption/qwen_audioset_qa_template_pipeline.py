@@ -139,7 +139,7 @@ Requirements for the question:
 2. The question should sound as if it is being asked about the audio itself, not about a caption or text.
 3. The question should be analytical and require synthesizing multiple audible cues, not a simple sound-label lookup.
 4. The question must stay within the specialized focus above.
-5. Vary the question starter naturally. Avoid copying the same opening pattern across many generations. Prefer concise evidence-seeking or inference-based openings such as "Which cues indicate...", "Why is this better characterized as...", "Based on the audio...", "Given the interplay between...", or "What can be inferred from..." when they fit the specialized focus.
+5. Vary the question starter naturally. Avoid repeatedly opening with "Based on..." or any single fixed phrase. Prefer a balanced mix of concise evidence-seeking, contrastive, inference-based, and mechanism-focused questions, such as "Which cues indicate...", "Why is this better characterized as...", "What can be inferred from...", "How do the sounds...", "What interaction suggests...", "Given the sequence of events...", or other natural forms that fit the specialized focus.
 6. Do not ask about unsupported facts such as exact identities, exact locations, recording equipment models, speaker names, or external cultural details unless explicitly stated.
 
 Requirements for the answer:
