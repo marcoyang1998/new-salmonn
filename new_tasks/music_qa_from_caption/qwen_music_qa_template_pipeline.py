@@ -28,6 +28,18 @@ from qwen_music_qa_pipeline import (
 
 DEFAULT_OUTPUT = "salmonn_data_v1.1/hq_music/youtube_crawled_gemini_music_captioning_segmented_40s_qwen3.5_35b_a3b_template_qa.json"
 DEFAULT_NUM_QA = 3
+LEAKAGE_PATTERNS = [
+    r"\bcaption\b",
+    r"\bdescription\b",
+    r"\btext description\b",
+    r"\bprovided text\b",
+    r"\bprovided information\b",
+    r"\bsource text\b",
+    r"\bprompt\b",
+    r"\bas stated\b",
+    r"\bthe text\b",
+    r"\bthe source\b",
+]
 
 
 def current_timestamp():
@@ -137,6 +149,7 @@ Requirements for the question:
 3. The question should be analytical and require synthesizing multiple details from the description.
 4. The question must stay within the specialized focus above.
 5. Do not ask about unsupported facts such as exact key, composer, artist, recording venue, microphone placement, specific chord names, or external cultural references unless explicitly stated.
+6. Do not default to "How" questions. Use a balanced variety of question starters across generations, such as "What evidence suggests...", "Why is...", "Which musical cues...", "Based on the audio...", "Given the...", "What can be inferred...", and "What aspects...". Use "How" only when it is the most natural fit for the specialized focus.
 
 Requirements for the answer:
 1. The answer must be fully supported by the provided description.
@@ -145,6 +158,7 @@ Requirements for the answer:
 4. Do not introduce new facts beyond the description.
 5. Do not mention that the answer is based on a caption or text description. Write as if the evidence comes from the audio.
 6. Use cautious, evidence-grounded language. Avoid overclaiming beyond the provided description. In particular, do not use overly definitive words such as "clearly", "obviously", "definitively", "undoubtedly", or "explicitly proves" unless the description directly warrants that level of certainty. Prefer formulations such as "the audio suggests", "the musical evidence indicates", "this supports the interpretation that", or "the piece is better characterized as". The answer should sound confident but should not imply stronger certainty than the evidence allows.
+7. Never refer to the input as a caption, description, prompt, source text, or provided text. Avoid phrases like "the description says", "the description notes", "the text states", "as stated", or "according to the provided information". Present all evidence as audible musical evidence.
 
 Output format:
 Return only valid JSON as one object:
@@ -227,6 +241,13 @@ def build_template_prompt(music_description, template):
     )
 
 
+def find_leakage(text):
+    for pattern in LEAKAGE_PATTERNS:
+        if re.search(pattern, text, flags=re.IGNORECASE):
+            return pattern
+    return None
+
+
 def parse_single_qa_response(text):
     text = strip_markdown_fence(text)
     try:
@@ -251,6 +272,12 @@ def parse_single_qa_response(text):
         raise ValueError("Generated QA has an empty question or answer.")
     if not question.startswith("<audio>"):
         question = "<audio>" + question.lstrip()
+    else:
+        question = "<audio>" + question[len("<audio>"):].lstrip()
+
+    leakage_pattern = find_leakage(f"{question}\n{answer}")
+    if leakage_pattern:
+        raise ValueError(f"Generated QA leaks meta-input wording matching {leakage_pattern!r}.")
     return {"question": question, "answer": answer}
 
 
