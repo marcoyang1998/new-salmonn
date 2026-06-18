@@ -151,7 +151,7 @@ Requirements for the question:
 3. The question should be analytical and require synthesizing multiple details from the description.
 4. The question must stay within the specialized focus above.
 5. Do not ask about unsupported facts such as exact key, composer, artist, recording venue, microphone placement, specific chord names, or external cultural references unless explicitly stated.
-6. Vary the question starter naturally. Do not repeatedly default to either "What" or "How". Prefer a balanced mix across generations, including starters such as "Why is...", "Which musical cues...", "Based on the audio...", "Given the...", "In what way...", "How does...", and occasional "What..." forms. Choose the starter that best fits the specialized focus.
+6. Vary the question starter naturally. Do not repeatedly default to "What", "How", or "In what way". Choose the wording that best fits the specialized focus, using a balanced mix of contrastive, evidence-seeking, inference-based, and mechanism-focused questions. Good openings can include "Why is...", "Which musical cues...", "Based on the audio...", "Given the...", "How does...", "What can be inferred...", or other natural forms, but avoid copying the same opening pattern across many generations.
 
 Requirements for the answer:
 1. The answer must be fully supported by the provided description.
