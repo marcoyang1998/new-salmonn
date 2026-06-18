@@ -11,6 +11,7 @@ from qwen_music_qa_pipeline import (
     DEFAULT_MODEL,
     DEFAULT_MODEL_PATH,
     append_failed_record,
+    call_local_qwen_batch,
     build_qa_salmonn_item,
     call_local_qwen,
     call_qwen,
@@ -254,6 +255,44 @@ def generate_one(generator, args, prompt):
     return call_local_qwen(model, tokenizer, args, prompt)
 
 
+def generate_many(generator, args, prompts):
+    if args.backend == "openai":
+        return [call_qwen(generator, args, prompt) for prompt in prompts]
+    model, tokenizer = generator
+    return call_local_qwen_batch(model, tokenizer, args, prompts)
+
+
+def generate_template_batch(generator, args, prompts, templates, source_index):
+    last_error = None
+    for attempt in range(1, args.max_retries + 1):
+        try:
+            raw_texts = generate_many(generator, args, prompts)
+            if len(raw_texts) != len(prompts):
+                raise ValueError(f"Expected {len(prompts)} batch outputs, got {len(raw_texts)}.")
+            qas = [parse_single_qa_response(raw_text) for raw_text in raw_texts]
+            return qas, []
+        except Exception as exc:
+            last_error = exc
+            print(
+                f"[WARN] source={source_index} batched generation "
+                f"attempt={attempt}/{args.max_retries} failed: {repr(exc)}",
+                flush=True,
+            )
+            print(traceback.format_exc(), flush=True)
+            if attempt < args.max_retries:
+                time.sleep(args.retry_sleep * attempt)
+
+    template_errors = [
+        {
+            "template_id": template["id"],
+            "error": repr(last_error),
+            "batch_failed": True,
+        }
+        for template in templates
+    ]
+    return None, template_errors
+
+
 def main():
     args = parse_args()
     input_path = Path(args.input)
@@ -285,33 +324,50 @@ def main():
             qa_items = []
             succeeded_template_ids = []
             template_errors = []
+            prompts = [build_template_prompt(caption, template) for template in selected_templates]
+            qas, batch_errors = generate_template_batch(
+                generator,
+                args,
+                prompts,
+                selected_templates,
+                source_index,
+            )
 
-            for template in selected_templates:
-                prompt = build_template_prompt(caption, template)
-                last_error = None
-                for attempt in range(1, args.max_retries + 1):
-                    try:
-                        raw_text = generate_one(generator, args, prompt)
-                        qa = parse_single_qa_response(raw_text)
-                        item = build_qa_salmonn_item(source_item, qa)
-                        qa_items.append(item)
-                        succeeded_template_ids.append(template["id"])
-                        break
-                    except Exception as exc:
-                        last_error = exc
-                        print(
-                            f"[WARN] source={source_index} template={template['id']} "
-                            f"attempt={attempt}/{args.max_retries} failed: {repr(exc)}",
-                            flush=True,
-                        )
-                        print(traceback.format_exc(), flush=True)
-                        if attempt < args.max_retries:
-                            time.sleep(args.retry_sleep * attempt)
-                else:
-                    template_errors.append({
-                        "template_id": template["id"],
-                        "error": repr(last_error),
-                    })
+            if qas is not None:
+                for template, qa in zip(selected_templates, qas):
+                    qa_items.append(build_qa_salmonn_item(source_item, qa))
+                    succeeded_template_ids.append(template["id"])
+            else:
+                template_errors.extend(batch_errors)
+                print(
+                    f"[WARN] source={source_index} falling back to per-template generation",
+                    flush=True,
+                )
+                for template, prompt in zip(selected_templates, prompts):
+                    last_error = None
+                    for attempt in range(1, args.max_retries + 1):
+                        try:
+                            raw_text = generate_one(generator, args, prompt)
+                            qa = parse_single_qa_response(raw_text)
+                            item = build_qa_salmonn_item(source_item, qa)
+                            qa_items.append(item)
+                            succeeded_template_ids.append(template["id"])
+                            break
+                        except Exception as exc:
+                            last_error = exc
+                            print(
+                                f"[WARN] source={source_index} template={template['id']} "
+                                f"attempt={attempt}/{args.max_retries} failed: {repr(exc)}",
+                                flush=True,
+                            )
+                            print(traceback.format_exc(), flush=True)
+                            if attempt < args.max_retries:
+                                time.sleep(args.retry_sleep * attempt)
+                    else:
+                        template_errors.append({
+                            "template_id": template["id"],
+                            "error": repr(last_error),
+                        })
 
             if qa_items:
                 record = {

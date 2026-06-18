@@ -264,6 +264,58 @@ def call_local_qwen(model, tokenizer, args, prompt):
     return tokenizer.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
 
 
+def call_local_qwen_batch(model, tokenizer, args, prompts):
+    import torch
+
+    if not prompts:
+        return []
+
+    texts = []
+    for prompt in prompts:
+        messages = [{"role": "user", "content": prompt}]
+        texts.append(
+            tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+                enable_thinking=False,
+            )
+        )
+
+    if tokenizer.pad_token_id is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    original_padding_side = tokenizer.padding_side
+    tokenizer.padding_side = "left"
+    try:
+        inputs = tokenizer(texts, return_tensors="pt", padding=True).to(model.device)
+    finally:
+        tokenizer.padding_side = original_padding_side
+
+    generation_kwargs = {
+        "max_new_tokens": args.max_tokens,
+        "do_sample": args.do_sample,
+        "pad_token_id": tokenizer.pad_token_id,
+        "repetition_penalty": args.repetition_penalty,
+    }
+    if args.do_sample:
+        generation_kwargs.update({
+            "temperature": args.temperature,
+            "top_p": args.top_p,
+            "top_k": args.top_k,
+        })
+        if args.min_p > 0:
+            generation_kwargs["min_p"] = args.min_p
+
+    with torch.inference_mode():
+        output_ids = model.generate(**inputs, **generation_kwargs)
+    generated_ids = output_ids[:, inputs.input_ids.shape[-1]:]
+    return [
+        text.strip()
+        for text in tokenizer.batch_decode(generated_ids, skip_special_tokens=True)
+    ]
+
+
 def build_qa_salmonn_item(source_item, qa):
     item = {
         "messages": [
