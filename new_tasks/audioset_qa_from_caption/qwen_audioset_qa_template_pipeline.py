@@ -26,7 +26,6 @@ LEAKAGE_PATTERNS = [
     r"\bmentioned\b",
     r"\bas stated\b",
     r"\bthe text\b",
-    r"\bthe source\b",
     r"\baccording to\b",
 ]
 
@@ -139,7 +138,7 @@ Requirements for the question:
 2. The question should sound as if it is being asked about the audio itself, not about a caption or text.
 3. The question should be analytical and require synthesizing multiple audible cues, not a simple sound-label lookup.
 4. The question must stay within the specialized focus above.
-5. Vary the question starter naturally. Avoid repeatedly opening with "Based on..." or any single fixed phrase. Prefer a balanced mix of concise evidence-seeking, contrastive, inference-based, and mechanism-focused questions, such as "Which cues indicate...", "Why is this better characterized as...", "What can be inferred from...", "How do the sounds...", "What interaction suggests...", "Given the sequence of events...", or other natural forms that fit the specialized focus.
+5. Vary the question starter naturally. Use a balanced mix of concise evidence-seeking, contrastive, inference-based, and mechanism-focused questions. It is good to sometimes begin with specific "Based on..." openings, such as "Based on the speaker's tone..." or "Based on the sequence of sounds...", but do not repeatedly use the generic phrase "Based on the acoustic evidence". Other useful openings include "Which cues indicate...", "Why is this better characterized as...", "What can be inferred from...", "How do the sounds...", "What interaction suggests...", and "Given the sequence of events...". Avoid copying the same opening pattern across many generations.
 6. Do not ask about unsupported facts such as exact identities, exact locations, recording equipment models, speaker names, or external cultural details unless explicitly stated.
 
 Requirements for the answer:
