@@ -355,7 +355,7 @@ def parse_single_qa_response(text):
     return {"question": question, "answer": answer}
 
 
-def build_qa_salmonn_item(source_item, qa):
+def build_qa_salmonn_item(source_item, qa, template_id=None):
     item = {
         "messages": [
             {"role": "user", "content": qa["question"]},
@@ -365,6 +365,8 @@ def build_qa_salmonn_item(source_item, qa):
         "durations": source_item["durations"],
         "task_type": "QA",
     }
+    if template_id is not None:
+        item["template_id"] = template_id
     for key in ("start_time", "end_time"):
         if key in source_item:
             item[key] = source_item[key]
@@ -652,7 +654,7 @@ def process_one_source(generator, args, job):
 
     if qas is not None:
         for template, qa in zip(selected_templates, qas):
-            qa_items.append(build_qa_salmonn_item(source_item, qa))
+            qa_items.append(build_qa_salmonn_item(source_item, qa, template["id"]))
             succeeded_template_ids.append(template["id"])
         return qa_items, succeeded_template_ids, template_errors
 
@@ -667,7 +669,7 @@ def process_one_source(generator, args, job):
             try:
                 raw_text = generate_one(generator, args, prompt)
                 qa = parse_single_qa_response(raw_text)
-                qa_items.append(build_qa_salmonn_item(source_item, qa))
+                qa_items.append(build_qa_salmonn_item(source_item, qa, template["id"]))
                 succeeded_template_ids.append(template["id"])
                 break
             except Exception as exc:
@@ -748,8 +750,8 @@ def process_source_jobs(generator, args, jobs, tmp_path, failed_path):
         source_item = job["source_item"]
         template_qa_pairs = grouped_qas[job["source_index"]]
         qa_items = [
-            build_qa_salmonn_item(source_item, qa)
-            for _, qa in template_qa_pairs
+            build_qa_salmonn_item(source_item, qa, template["id"])
+            for template, qa in template_qa_pairs
         ]
         succeeded_template_ids = [
             template["id"]
@@ -780,7 +782,9 @@ def write_final_json_from_checkpoint(tmp_path, output_path):
                     for item in record.get("qa_items", []):
                         if not first:
                             out_f.write(",\n")
-                        out_f.write(json.dumps(item, ensure_ascii=False, separators=(", ", ": ")))
+                        final_item = dict(item)
+                        final_item.pop("template_id", None)
+                        out_f.write(json.dumps(final_item, ensure_ascii=False, separators=(", ", ": ")))
                         first = False
                         total_items += 1
         out_f.write("\n]}\n")
