@@ -1,9 +1,11 @@
 import argparse
 import json
+import os
 import random
 import re
 import time
 import traceback
+from datetime import datetime
 from pathlib import Path
 
 from qwen_music_qa_pipeline import (
@@ -26,6 +28,25 @@ from qwen_music_qa_pipeline import (
 
 DEFAULT_OUTPUT = "salmonn_data_v1.1/hq_music/youtube_crawled_gemini_music_captioning_segmented_40s_qwen3.5_35b_a3b_template_qa.json"
 DEFAULT_NUM_QA = 3
+
+
+def current_timestamp():
+    return datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S%z")
+
+
+def get_rank_id():
+    for key in ("RANK_ID", "RANK", "LOCAL_RANK", "SLURM_PROCID"):
+        value = os.environ.get(key)
+        if value is not None and value != "":
+            return value
+    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+    if cuda_visible_devices:
+        return f"gpu:{cuda_visible_devices}"
+    return "main"
+
+
+def log_message(message, level="INFO"):
+    print(f"[{current_timestamp()}][rank {get_rank_id()}][{level}] {message}", flush=True)
 
 
 META_QA_TEMPLATES = [
@@ -273,10 +294,10 @@ def generate_template_batch(generator, args, prompts, templates, source_index):
             return qas, []
         except Exception as exc:
             last_error = exc
-            print(
+            log_message(
                 f"[WARN] source={source_index} batched generation "
                 f"attempt={attempt}/{args.max_retries} failed: {repr(exc)}",
-                flush=True,
+                level="WARN",
             )
             print(traceback.format_exc(), flush=True)
             if attempt < args.max_retries:
@@ -307,7 +328,7 @@ def main():
 
     if args.finalize_only:
         total, missing = finalize_output(tmp_path, output_path, len(data))
-        print(f"Wrote {total} QA training items to {output_path}; missing/skipped source items: {missing}")
+        log_message(f"Wrote {total} QA training items to {output_path}; missing/skipped source items: {missing}")
         return
 
     generator = load_generator(args)
@@ -339,9 +360,9 @@ def main():
                     succeeded_template_ids.append(template["id"])
             else:
                 template_errors.extend(batch_errors)
-                print(
+                log_message(
                     f"[WARN] source={source_index} falling back to per-template generation",
-                    flush=True,
+                    level="WARN",
                 )
                 for template, prompt in zip(selected_templates, prompts):
                     last_error = None
@@ -355,10 +376,10 @@ def main():
                             break
                         except Exception as exc:
                             last_error = exc
-                            print(
+                            log_message(
                                 f"[WARN] source={source_index} template={template['id']} "
                                 f"attempt={attempt}/{args.max_retries} failed: {repr(exc)}",
-                                flush=True,
+                                level="WARN",
                             )
                             print(traceback.format_exc(), flush=True)
                             if attempt < args.max_retries:
@@ -378,10 +399,10 @@ def main():
                 }
                 tmp_f.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
                 tmp_f.flush()
-                print(
-                    f"[{source_index + 1}/{len(data)}] generated {len(qa_items)} QA items "
-                    f"from {len(selected_templates)} selected templates",
-                    flush=True,
+                log_message(
+                    f"source={source_index} progress={source_index + 1}/{len(data)} "
+                    f"generated={len(qa_items)} selected_templates={len(selected_templates)} "
+                    f"template_ids={','.join(succeeded_template_ids)}"
                 )
             else:
                 append_failed_record(
@@ -392,14 +413,14 @@ def main():
                         "template_errors": template_errors,
                     },
                 )
-                print(
+                log_message(
                     f"[ERROR] Skipping source index {source_index}; all selected templates failed. "
                     f"Logged to {failed_path}",
-                    flush=True,
+                    level="ERROR",
                 )
 
     total, missing = finalize_output(tmp_path, output_path, len(data))
-    print(f"Wrote {total} QA training items to {output_path}; missing/skipped source items: {missing}")
+    log_message(f"Wrote {total} QA training items to {output_path}; missing/skipped source items: {missing}")
 
 
 if __name__ == "__main__":
