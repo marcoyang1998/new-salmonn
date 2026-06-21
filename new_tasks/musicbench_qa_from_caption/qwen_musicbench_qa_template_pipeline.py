@@ -65,6 +65,25 @@ LEAKAGE_PATTERNS = [
     r"\bthe source\b",
 ]
 
+BAD_GENERATION_PATTERNS = [
+    r"\bexplicitly (?:described|stated|mentioned)\b",
+    r"\blikely captured\b",
+    r"\bcaptured in a single take\b",
+    r"\bsingle[- ]take\b",
+    r"\brequires a clear\b",
+    r"\bnatural reverb tail\b",
+    r"\bconfirm(?:s|ed)? that\b",
+]
+
+SOURCE_CONDITIONAL_PATTERNS = [
+    (r"\breverb(?:erant| tail)?\b|\breverberant\b|\becho(?:ey|ing)?\b", r"\breverb|\breverber|\becho"),
+    (r"\bstudio\b", r"\bstudio\b"),
+    (r"\bmicrophone\b|\bmic\b", r"\bmicrophone\b|\bmic\b"),
+    (r"\bsingle[- ]take\b|\bone take\b", r"\bsingle[- ]take\b|\bone take\b"),
+    (r"\btriplet feel\b|\btriplets?\b", r"\btriplets?\b"),
+    (r"\bdry acoustic space\b|\bdry room\b|\bdry production\b|\bdry mix\b", r"\bdry\b"),
+]
+
 
 META_QA_TEMPLATES = [
     {
@@ -112,8 +131,8 @@ META_QA_TEMPLATES = [
     },
     {
         "id": "production_recording_texture",
-        "instruction": "Generate one QA pair about production, recording texture, sonic clarity, reverb, electronic treatment, or mix density, and connect it to the perceived atmosphere.",
-        "patterns": [r"\b(reverb|distortion|electronic|synth|synthesizer|production|recording|sound quality|lo-fi|clear|space|dense|sparse|mix|texture)\b"],
+        "instruction": "Generate one QA pair about explicitly stated recording or production evidence, such as low sound quality, distortion, reverb, an empty-room sound, electronic treatment, or clear sonic texture. Restate weak recording clues conservatively and do not infer studio setup, microphone technique, single-take capture, room acoustics, or causes of the sound quality.",
+        "patterns": [r"\b(reverb|distortion|recording|recorded|sound quality|low quality|poor quality|lo-fi|empty room|electronic treatment|sonic clarity|clear sound|unclear|noisy)\b"],
     },
     {
         "id": "augmentation_invariant_core",
@@ -136,6 +155,9 @@ A detailed music description:
 Specialized QA focus:
 {template_instruction}
 
+Precision guidance:
+{precision_instruction}
+
 Requirements for the question:
 1. The question must begin with "<audio>".
 2. The question should sound as if it is being asked about the audio itself, not about a caption, text, prompt, or metadata record.
@@ -151,6 +173,7 @@ Requirements for the answer:
 4. Do not introduce new facts beyond the music information.
 5. Do not mention captions, descriptions, prompts, metadata, provided text, or source text. Present all evidence as audible musical evidence.
 6. Use cautious, evidence-grounded language. Avoid overclaiming with words such as "obviously", "definitively", or "undoubtedly" unless the evidence directly warrants it.
+7. Do not infer production setup, live/studio context, reverb, room acoustics, microphone placement, single-take performance, or physical recording conditions unless those details are directly stated. For weak clues like "low quality" or "empty room", keep the explanation close to those words without inventing a cause.
 
 Output format:
 Return only valid JSON as one object:
@@ -421,10 +444,25 @@ def sample_templates(source_item: dict[str, Any], source_index: int, num_templat
     return rng.sample(templates, num_templates)
 
 
+def precision_instruction(template: dict[str, Any]) -> str:
+    if template["id"] in {"harmony_tonality_structure", "rhythm_dynamics_energy"}:
+        return (
+            "You may use exact BPM, meter, key, or chord labels when they are present, "
+            "but do not make the QA a simple metadata lookup. Connect those facts to "
+            "audible musical effect, such as energy, stability, mood, or structure."
+        )
+    return (
+        "Avoid centering the QA on exact BPM, key, chord names, or other label-like facts. "
+        "If such facts are present, translate them into broader musical effects and "
+        "prioritize instrumentation, texture, rhythm, mood, and arrangement evidence."
+    )
+
+
 def build_template_prompt(music_description: str, template: dict[str, Any]) -> str:
     return PROMPT_TEMPLATE.format(
         music_description=music_description.strip(),
         template_instruction=template["instruction"],
+        precision_instruction=precision_instruction(template),
     )
 
 
@@ -435,7 +473,19 @@ def find_leakage(text: str) -> str | None:
     return None
 
 
-def parse_single_qa_response(text: str) -> dict[str, str]:
+def find_quality_issue(text: str, source_text: str) -> str | None:
+    source_text = source_text.lower()
+    for pattern in BAD_GENERATION_PATTERNS:
+        if re.search(pattern, text, flags=re.IGNORECASE):
+            return f"over-inference or meta phrasing matching {pattern!r}"
+
+    for output_pattern, source_pattern in SOURCE_CONDITIONAL_PATTERNS:
+        if re.search(output_pattern, text, flags=re.IGNORECASE) and not re.search(source_pattern, source_text, flags=re.IGNORECASE):
+            return f"unsupported production/detail inference matching {output_pattern!r}"
+    return None
+
+
+def parse_single_qa_response(text: str, source_text: str = "") -> dict[str, str]:
     text = strip_markdown_fence(text)
     try:
         parsed = json.loads(text)
@@ -465,6 +515,9 @@ def parse_single_qa_response(text: str) -> dict[str, str]:
     leakage_pattern = find_leakage(f"{question}\n{answer}")
     if leakage_pattern:
         raise ValueError(f"Generated QA leaks meta-input wording matching {leakage_pattern!r}.")
+    quality_issue = find_quality_issue(f"{question}\n{answer}", source_text)
+    if quality_issue:
+        raise ValueError(f"Generated QA failed quality filter: {quality_issue}.")
     return {"question": question, "answer": answer}
 
 
@@ -518,7 +571,12 @@ def generate_source_batch(generator, args: argparse.Namespace, jobs: list[dict[s
     prompt_entries = []
     for job in jobs:
         for template, prompt in zip(job["selected_templates"], job["prompts"]):
-            prompt_entries.append({"source_index": job["source_index"], "template": template, "prompt": prompt})
+            prompt_entries.append({
+                "source_index": job["source_index"],
+                "template": template,
+                "prompt": prompt,
+                "source_text": job["source_item"]["caption"],
+            })
     if not prompt_entries:
         return {}, []
 
@@ -531,7 +589,7 @@ def generate_source_batch(generator, args: argparse.Namespace, jobs: list[dict[s
                 raise ValueError(f"Expected {len(prompt_entries)} batch outputs, got {len(raw_texts)}.")
             grouped_qas = {job["source_index"]: [] for job in jobs}
             for entry, raw_text in zip(prompt_entries, raw_texts):
-                qa = parse_single_qa_response(raw_text)
+                qa = parse_single_qa_response(raw_text, entry["source_text"])
                 grouped_qas[entry["source_index"]].append((entry["template"], qa))
             return grouped_qas, []
         except Exception as exc:
@@ -567,7 +625,7 @@ def process_one_source(generator, args: argparse.Namespace, job: dict[str, Any])
         last_error = None
         for attempt in range(1, args.max_retries + 1):
             try:
-                qa = parse_single_qa_response(generate_one(generator, args, prompt))
+                qa = parse_single_qa_response(generate_one(generator, args, prompt), source_item["caption"])
                 qa_items.append(build_qa_item(source_item, qa))
                 succeeded_template_ids.append(template["id"])
                 break
