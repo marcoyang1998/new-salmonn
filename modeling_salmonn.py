@@ -89,10 +89,14 @@ class SALMONN(PreTrainedModel):
         self.encoder_type = model_args.encoder_type
         self.freeze_encoder = model_args.freeze_encoder
         self.llm_type = model_args.llm_type
+        self.llm_model_type = getattr(config, "model_type", "")
         if self.llm_type == "Llama":
             self._no_split_modules =  ["LlamaDecoderLayer"]
         elif self.llm_type == "Qwen":
-            self._no_split_modules = ["Qwen3DecoderLayer"]
+            if self.llm_model_type == "qwen3_moe":
+                self._no_split_modules = ["Qwen3MoeDecoderLayer"]
+            else:
+                self._no_split_modules = ["Qwen3DecoderLayer"]
 
         if model_args.base_llm_path:
             self.base_llm = AutoModelForCausalLM.from_pretrained(
@@ -594,6 +598,13 @@ class SALMONN(PreTrainedModel):
             lora_dropout=model_args.lora_dropout,
             use_dora=dora,
         )
+        if getattr(self.base_llm.config, "model_type", "") == "qwen3_moe":
+            lora_kwargs["target_modules"] = [
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+            ]
         if expand_vocab:
             lora_kwargs["modules_to_save"] = ["embed_tokens", "lm_head"]
             self.base_llm.config.tie_word_embeddings = False

@@ -183,6 +183,13 @@ class SALMONN_Dataset(Dataset):
 
         self.encoder_type = encoder_type
         self.llm_type = llm_type
+        self.qwen_template_supports_thinking = self._qwen_template_supports_thinking()
+        if self.llm_type == "Qwen" and self.skip_thinking_token_loss and not self.qwen_template_supports_thinking:
+            print(
+                "[Dataset] skip_thinking_token_loss=True, but this Qwen tokenizer chat template "
+                "does not emit thinking-control tokens; assistant label shift will remain 3.",
+                flush=True,
+            )
         if encoder_type == "zipformer2" or encoder_type == "spear_transformer":
             self.fbank = Fbank(FbankConfig(num_mel_bins=128))
         elif encoder_type == "dasheng":
@@ -339,6 +346,12 @@ class SALMONN_Dataset(Dataset):
             and chat["reasoning_content"].strip()
             for chat in chats
         )
+
+    def _qwen_template_supports_thinking(self) -> bool:
+        if self.llm_type != "Qwen":
+            return False
+        chat_template = getattr(self.tokenizer, "chat_template", "") or ""
+        return "enable_thinking" in chat_template or "<think>" in chat_template or "</think>" in chat_template
 
     def _get_oracle_biasing_words(self, sample: Dict) -> set:
         oracle_words = sample.get("ground_truth_biasing_list", [])
@@ -774,7 +787,11 @@ class SALMONN_Dataset(Dataset):
             im_end_id = 151645
             assistant_id = 77091
             shift_num = 3
-            if self.skip_thinking_token_loss and not has_reasoning_content:
+            if (
+                self.skip_thinking_token_loss
+                and self.qwen_template_supports_thinking
+                and not has_reasoning_content
+            ):
                 shift_num = 3 + 4
         elif self.llm_type == "Llama":
             im_start_id = 128006
