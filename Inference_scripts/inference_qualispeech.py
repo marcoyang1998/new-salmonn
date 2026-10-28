@@ -104,6 +104,7 @@ def load_model_and_tokenizer(args):
         torch_dtype="auto",
         device_map="auto",
     )
+    model.register_backbone_tokenizer(tokenizer)
     if model_args.inject_temporal_embedding:
         model.register_temporal_tokens(tokenizer)
     if getattr(model_args, "inject_temporal_embedding_nl", False):
@@ -235,12 +236,8 @@ def extract_score(model_output_raw):
 
 def run_one_item(audio_path, prompt, fbank, model, tokenizer, model_args, max_new_tokens, audio_loader):
     messages = [{"role": "user", "content": prompt}]
-    text = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-        enable_thinking=False,
-    )
+    from backbone_compat import render_chat
+    text = render_chat(tokenizer, messages, add_generation_prompt=True, enable_thinking=False)
 
     feature, raw_wavs, audio_nums, split_feature_lens = extract_features(
         audio_path,

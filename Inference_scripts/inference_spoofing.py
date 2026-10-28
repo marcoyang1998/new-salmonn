@@ -73,12 +73,8 @@ def get_user_prompt(item):
 
 def run_one_item(audio_path, prompt, fbank, model, tokenizer, model_args, max_new_tokens, audio_loader):
     messages = [{"role": "user", "content": prompt}]
-    text = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-        enable_thinking=False,
-    )
+    from backbone_compat import render_chat
+    text = render_chat(tokenizer, messages, add_generation_prompt=True, enable_thinking=False)
 
     feature, raw_wavs, audio_nums, split_feature_lens = extract_features(
         audio_path,

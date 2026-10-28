@@ -15,6 +15,7 @@ from torch.utils.data import Dataset
 from lhotse import Fbank, FbankConfig
 from torchaudio.transforms import MelSpectrogram
 from transformers import AutoFeatureExtractor, WhisperFeatureExtractor, AutoProcessor
+from backbone_compat import build_assistant_labels, template_supports_thinking
 import soundfile as sf
 PETRELOSS_CONFIG = "/mnt/shared-storage-user/housiyuan/xiaoyu/petreloss.conf"
 MC_PROMPT_INSTRUCTIONS = {
@@ -77,7 +78,7 @@ class SALMONN_Dataset(Dataset):
         )
         return data
 
-    def __init__(self, args, tokenizer, encoder_type, llm_type):
+    def __init__(self, args, tokenizer, encoder_type, llm_type, backbone_capabilities=None):
         super().__init__()
 
         self.args = args
@@ -183,6 +184,7 @@ class SALMONN_Dataset(Dataset):
 
         self.encoder_type = encoder_type
         self.llm_type = llm_type
+        self.backbone_capabilities = backbone_capabilities
         self.qwen_template_supports_thinking = self._qwen_template_supports_thinking()
         if self.llm_type == "Qwen" and self.skip_thinking_token_loss and not self.qwen_template_supports_thinking:
             print(
@@ -350,8 +352,7 @@ class SALMONN_Dataset(Dataset):
     def _qwen_template_supports_thinking(self) -> bool:
         if self.llm_type != "Qwen":
             return False
-        chat_template = getattr(self.tokenizer, "chat_template", "") or ""
-        return "enable_thinking" in chat_template or "<think>" in chat_template or "</think>" in chat_template
+        return template_supports_thinking(self.tokenizer)
 
     def _get_oracle_biasing_words(self, sample: Dict) -> set:
         oracle_words = sample.get("ground_truth_biasing_list", [])
@@ -758,6 +759,11 @@ class SALMONN_Dataset(Dataset):
         else:
             chats = sample["messages"]
         has_reasoning_content = self._has_reasoning_content(chats)
+        if self.llm_type == "Qwen" and not self.qwen_template_supports_thinking and has_reasoning_content:
+            chats = copy.deepcopy(chats)
+            for chat in chats:
+                chat.pop("reasoning_content", None)
+            has_reasoning_content = False
         
         self._verify_chat(chats)
         audio_placeholder_count = chats[0]["content"].count("<audio>")
@@ -771,38 +777,22 @@ class SALMONN_Dataset(Dataset):
                 f"Audio feature group count ({len(audio_feature_groups)}) does not match expanded audio count "
                 f"({sum(audio_nums)}): {audio_files}"
             )
-        text = self.tokenizer.apply_chat_template(chats,tokenize=False)
-        if self.llm_type == "Qwen":
-            for audio_num in audio_nums:
-                text = text.replace("<audio>","<|vision_start|>"*audio_num+"<|vision_end|>",1)
-            model_inputs = self.tokenizer(text, return_tensors="pt")
-        elif self.llm_type == "Llama":
-            model_inputs = self.tokenizer(text.replace("<audio>","<|reserved_special_token_0|><|reserved_special_token_1|>"), return_tensors="pt", add_special_tokens=False)
+        if self.backbone_capabilities is None:
+            raise RuntimeError("Dataset requires registered backbone tokenizer capabilities.")
+        skip_thinking = (
+            self.skip_thinking_token_loss
+            and self.qwen_template_supports_thinking
+            and not has_reasoning_content
+        )
+        model_inputs, labels, text = build_assistant_labels(
+            self.tokenizer,
+            chats,
+            audio_nums,
+            self.backbone_capabilities,
+            skip_thinking=skip_thinking,
+        )
         input_ids = model_inputs["input_ids"][0]
         attention_mask = model_inputs["attention_mask"][0]
-
-        labels = torch.full((input_ids.shape[-1],), fill_value=-100, dtype=torch.long)
-        if self.llm_type == "Qwen":
-            im_start_id = 151644
-            im_end_id = 151645
-            assistant_id = 77091
-            shift_num = 3
-            if (
-                self.skip_thinking_token_loss
-                and self.qwen_template_supports_thinking
-                and not has_reasoning_content
-            ):
-                shift_num = 3 + 4
-        elif self.llm_type == "Llama":
-            im_start_id = 128006
-            im_end_id = 128009
-            assistant_id = 78191
-            shift_num = 4
-        im_start_idx = (input_ids == im_start_id).nonzero(as_tuple=True)[0]
-        im_end_idx = (input_ids == im_end_id).nonzero(as_tuple=True)[0]
-        for idx, end_idx in zip(im_start_idx, im_end_idx):
-            if input_ids[idx+1] == assistant_id:
-                labels[idx+shift_num:end_idx+1] = input_ids[idx+shift_num:end_idx+1]
 
         new_sample = {}
         new_sample["input_ids"] = input_ids

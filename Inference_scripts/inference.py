@@ -16,7 +16,7 @@ model_args = ModelArguments(
     speech_encoder_path="/mnt/bn/audio-visual-llm-data6/wangsiyin/SALMONN/wavlm",
     connector_hid_size=8192,
 )
-tokenizer = AutoTokenizer.from_pretrained("/mnt/bn/audio-visual-llm-data6/ckpts/Qwen3-8B")
+tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path)
 model = SALMONN.from_pretrained(
     model_args.model_name_or_path,
     config=AutoConfig.from_pretrained(os.path.join(model_args.model_name_or_path,"config.json")),
@@ -24,6 +24,7 @@ model = SALMONN.from_pretrained(
     torch_dtype="auto",
     device_map="auto"
 )
+model.register_backbone_tokenizer(tokenizer)
 maybe_init_qwen3_embedding_model(model, model_args)
 
 fbank = get_fbank(model_args)

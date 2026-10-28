@@ -159,41 +159,16 @@ def get_audio_paths(sample: dict, use_ctx_audio: bool = True) -> list[str]:
 
 
 def prepare_model_inputs(texts: list[str], audio_nums: list[int], tokenizer, model, model_args):
-    if model_args.llm_type == "Llama":
-        processed_texts = [
-            text.replace("<audio>", "<|reserved_special_token_0|><|reserved_special_token_1|>")
-            for text in texts
-        ]
-    elif audio_nums:
-        processed_texts = []
-        text_index = 0
-        text = texts[text_index]
-        for audio_num in audio_nums:
-            while "<audio>" not in text:
-                processed_texts.append(text)
-                text_index += 1
-                text = texts[text_index]
-            text = text.replace("<audio>", "<|vision_start|>" * audio_num + "<|vision_end|>", 1)
-        processed_texts.append(text)
-        processed_texts.extend(texts[len(processed_texts):])
-    else:
-        processed_texts = [text.replace("<audio>", "<|vision_start|><|vision_end|>") for text in texts]
-
-    return tokenizer(processed_texts, return_tensors="pt", padding=True, padding_side="left").to(model.device)
+    from inference_utils import prepare_model_inputs as prepare_shared_inputs
+    if not audio_nums:
+        audio_nums = [1] * sum(text.count("<audio>") for text in texts)
+    return prepare_shared_inputs(texts, audio_nums, tokenizer, model)
 
 
-def clean_model_output(generated_id, tokenizer) -> str:
-    output_ids = generated_id.tolist()
-    try:
-        index = len(output_ids) - output_ids[::-1].index(151668)
-        output_ids = output_ids[index:]
-    except ValueError:
-        pass
-    content = tokenizer.decode(output_ids, skip_special_tokens=True).strip()
-    content = content.split("</think>")[-1].strip()
-    if content.startswith("<think>"):
-        content = content.replace("<think>", "", 1).strip()
-    return content
+def clean_model_output(generated_id, tokenizer, model) -> str:
+    from backbone_compat import clean_generated_output
+    content = tokenizer.decode(generated_id.tolist(), skip_special_tokens=True)
+    return clean_generated_output(content, model.backbone_capabilities)
 
 
 def get_generation_config(args):
@@ -240,6 +215,7 @@ def load_model_and_tokenizer(args):
         torch_dtype="auto",
         device_map="auto",
     )
+    model.register_backbone_tokenizer(tokenizer)
     if getattr(model_args, "inject_temporal_embedding", False):
         model.register_temporal_tokens(tokenizer)
     if getattr(model_args, "inject_temporal_embedding_nl", False):
@@ -265,9 +241,10 @@ def generate_batch(batch, model, tokenizer, fbank, model_args, args):
         main_audio_num = len(get_main_audio_paths(sample))
         audio_paths.extend(get_audio_paths(sample, use_ctx_audio=args.use_ctx_audio))
         messages = [{"role": "user", "content": "<audio>" * main_audio_num + prompt}]
-        text = tokenizer.apply_chat_template(
+        from backbone_compat import render_chat
+        text = render_chat(
+            tokenizer,
             messages,
-            tokenize=False,
             add_generation_prompt=True,
             enable_thinking=not args.disable_thinking,
         )
@@ -295,7 +272,7 @@ def generate_batch(batch, model, tokenizer, fbank, model_args, args):
             **generation_config,
         )
 
-    return [clean_model_output(generated_id, tokenizer) for generated_id in generated_ids]
+    return [clean_model_output(generated_id, tokenizer, model) for generated_id in generated_ids]
 
 
 def main():

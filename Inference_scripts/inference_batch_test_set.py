@@ -7,7 +7,7 @@ from inference_manager import InferenceManager
 from argparse import ArgumentParser
 from pathlib import Path
 
-TOKENIZER_PATH="/mnt/shared-storage-gpfs2/brainllm2-share/xiaoyu/models/Qwen3-8B"
+TOKENIZER_PATH=None
 DEFAULT_WRITE_PATH_PARENT = "/mnt/shared-storage-gpfs2/brainllm2-share/xiaoyu/SALMONN_wenyi/results"
 
 logging.basicConfig(level=logging.ERROR, force=True)
@@ -135,7 +135,12 @@ if __name__ == "__main__":
     parser.add_argument("--write_path_title", type=str, default = None, required=True)
     parser.add_argument("--checkpoint_path", type=str, default=None, required=True) # it will automatically know which model_argument to use from this
     parser.add_argument("--disable_thinking", type=str2bool, default=True, help="If True, we forced the model to skip thinking")
-    parser.add_argument("--tokenizer_path", type=str, default=TOKENIZER_PATH)
+    parser.add_argument(
+        "--tokenizer_path",
+        type=str,
+        default=None,
+        help="Optional recovery override. By default the tokenizer saved in the SALMONN checkpoint is used.",
+    )
     
     # Decoding related
     parser.add_argument("--use_beam_search", type=str2bool, default=False, help="If True, use beam search; otherwise greedy decoding")

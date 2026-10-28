@@ -163,26 +163,15 @@ def extract_features(audio_paths, fbank, model_args):
 
 
 def prepare_model_inputs(text, tokenizer, model, model_args):
-    if model_args.llm_type == "Qwen":
-        return tokenizer(
-            [text.replace("<audio>", "<|vision_start|><|vision_end|>")], return_tensors="pt"
-        ).to(model.device)
-    elif model_args.llm_type == "Llama":
-        return tokenizer(
-            [text.replace("<audio>", "<|reserved_special_token_0|><|reserved_special_token_1|>")],
-            return_tensors="pt",
-        ).to(model.device)
+    from inference_utils import prepare_model_inputs as prepare_shared_inputs
+    return prepare_shared_inputs([text], [1] * text.count("<audio>"), tokenizer, model)
 
 
-def parse_model_output(generated_ids, tokenizer):
+def parse_model_output(generated_ids, tokenizer, model):
     """Strip thinking tokens and return the cleaned output string."""
-    output_ids = generated_ids[0].tolist()
-    try:
-        index = len(output_ids) - output_ids[::-1].index(151668)  # </think>
-    except ValueError:
-        index = 0
-    content = tokenizer.decode(output_ids[index:], skip_special_tokens=True).strip("\n")
-    return content.strip().strip(".")
+    from backbone_compat import clean_generated_output
+    content = tokenizer.decode(generated_ids[0].tolist(), skip_special_tokens=True)
+    return clean_generated_output(content, model.backbone_capabilities).strip(".")
 
 
 def extract_predicted_letter(model_output_raw, choices):
@@ -251,6 +240,7 @@ def main():
         torch_dtype="auto",
         device_map="auto",
     )
+    model.register_backbone_tokenizer(tokenizer)
     if model_args.inject_temporal_embedding:
         model.register_temporal_tokens(tokenizer)
     if getattr(model_args, "inject_temporal_embedding_nl", False):
@@ -339,12 +329,8 @@ def main():
             user_content = "<audio>" + prompt
             user_prompt = prompt
         messages = [{"role": "user", "content": user_content}]
-        text = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=False,  # True necessary for reasoning models
-        )
+        from backbone_compat import render_chat
+        text = render_chat(tokenizer, messages, add_generation_prompt=True, enable_thinking=False)
 
         feature, audio_nums = extract_features(
             audio_paths, fbank, model_args
@@ -375,7 +361,7 @@ def main():
                 max_new_tokens=500,
             )
 
-        model_output_raw = parse_model_output(generated_ids, tokenizer)
+        model_output_raw = parse_model_output(generated_ids, tokenizer, model)
 
         if is_open or is_instruction_following:
             model_outputs[i] = model_output_raw

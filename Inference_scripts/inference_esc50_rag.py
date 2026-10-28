@@ -311,6 +311,7 @@ def load_model(model_name_or_path, encoder_type=None, concat_encoder_features=No
         torch_dtype="auto",
         device_map="auto",
     )
+    model.register_backbone_tokenizer(tokenizer)
     maybe_init_qwen3_embedding_model(model, model_args)
     model.eval()
     return model, tokenizer, model_args
@@ -577,12 +578,8 @@ def evaluate_fold(
         prompt = build_prompt(base_prompt, rag_context)
 
         messages = [{"role": "user", "content": "<audio>" + prompt}]
-        text = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=True,
-        )
+        from backbone_compat import render_chat
+        text = render_chat(tokenizer, messages, add_generation_prompt=True, enable_thinking=True)
 
         feature_t, feature_lens_t, raw_wavs_t, audio_nums = get_feature_tensors(audio_path, fbank, model, model_args)
         model_inputs = cast(dict[str, Any], prepare_model_inputs(text, audio_nums, tokenizer, model, model_args))

@@ -9,6 +9,7 @@ import math
 import json
 import logging
 import os
+from backbone_compat import replace_audio_placeholders
 
 MC_PROMPT_INSTRUCTIONS = {
     "neutral": "Please output only the single letter corresponding to the correct option.",
@@ -408,19 +409,20 @@ def extract_audio_features(audio_paths: list[str], fbank: Fbank, model, model_ar
     return features, feature_lens, raw_wavs, audio_nums
 
 def prepare_model_inputs(texts: list[str], audio_nums: list[int], tokenizer: AutoTokenizer, model) -> dict:
-    if len(audio_nums):
-        processed_text = []
-        text_num = 0
-        text = texts[text_num]
-        for audio_num in audio_nums:
-            if text.find("<audio>") == -1:
-                processed_text.append(text)
-                text_num += 1
-                text = texts[text_num]
-            text = text.replace("<audio>","<|vision_start|>"*audio_num+"<|vision_end|>",1)
-        processed_text.append(text)
-    else:
-        processed_text = [text.replace("<audio>", "<|vision_start|><|vision_end|>") for text in texts]
+    capabilities = getattr(model, "backbone_capabilities", None)
+    if capabilities is None:
+        raise RuntimeError("Model tokenizer capabilities must be registered before preparing inputs.")
+    processed_text = []
+    offset = 0
+    for text in texts:
+        count = text.count("<audio>")
+        groups = audio_nums[offset : offset + count]
+        if count and len(groups) != count:
+            raise ValueError("Not enough audio groups for the rendered batch prompts.")
+        processed_text.append(replace_audio_placeholders(text, groups, capabilities))
+        offset += count
+    if offset != len(audio_nums):
+        raise ValueError(f"Unused audio groups while preparing prompts: consumed {offset}, got {len(audio_nums)}.")
     return tokenizer(
         processed_text,
         return_tensors="pt",

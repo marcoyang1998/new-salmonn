@@ -12,7 +12,7 @@ from inference_utils import ModelArguments, extract_audio_features, get_audio_pa
 model_args = ModelArguments(
     model_name_or_path="/mnt/bn/audio-visual-llm-data6/wangsiyin/SALMONN/output/arnold_all_bs192_step40000_2s/checkpoint-30000",
 )
-tokenizer = AutoTokenizer.from_pretrained("/mnt/bn/audio-visual-llm-data6/ckpts/Qwen3-8B")
+tokenizer = AutoTokenizer.from_pretrained(model_args.model_name_or_path)
 tokenizer.padding_side = "left"
 model = SALMONN.from_pretrained(
     model_args.model_name_or_path,
@@ -21,6 +21,7 @@ model = SALMONN.from_pretrained(
     torch_dtype="auto",
     device_map=0
 )
+model.register_backbone_tokenizer(tokenizer)
 maybe_init_qwen3_embedding_model(model, model_args)
 fbank = get_fbank(model_args)
 def makeInference(data):
@@ -75,7 +76,8 @@ def makeInference(data):
         print("="*60)
         print("Start of Cleaned Content")
         print("="*60)
-        cleaned_content = content.split("</think>")[-1].strip()
+        from backbone_compat import clean_generated_output
+        cleaned_content = clean_generated_output(content, model.backbone_capabilities)
         print(cleaned_content)
 
 

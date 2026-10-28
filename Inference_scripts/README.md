@@ -90,6 +90,11 @@ python inference_batch_test_set.py \
 
 ## 快速开始示例
 
+Qwen2.5-7B-Instruct checkpoints should omit `--tokenizer_path`; inference loads
+the tokenizer saved in the SALMONN checkpoint and validates its identity. The
+backbone has no native Qwen3 thinking mode, so output is decoded directly even
+if the shared CLI retains `--disable_thinking` for Qwen3 compatibility.
+
 ### 场景1: 完整推理 (3卡)
 ```bash
 python inference_batch_multiprocess_single_file.py \

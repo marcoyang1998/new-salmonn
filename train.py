@@ -16,6 +16,7 @@ from torch.utils.data import Sampler
 
 from modeling_salmonn import SALMONN
 from salmonn_datasets import SALMONN_Dataset
+from backbone_compat import validate_saved_identity
 
 @dataclass
 class ModelArguments:
@@ -210,10 +211,31 @@ def load_model_and_dataset(model_args, data_args, training_args):
             torch_dtype="auto",
             low_cpu_mem_usage=False,
         )
+    capabilities = model.register_backbone_tokenizer(tokenizer)
+    if not training_args.from_scratch:
+        metadata_paths = (
+            os.path.join(model_args.model_name_or_path, "config.json"),
+            os.path.join(os.path.dirname(model_args.model_name_or_path), "config.json"),
+        )
+        saved_identity = None
+        for metadata_path in metadata_paths:
+            if os.path.isfile(metadata_path):
+                with open(metadata_path) as metadata_file:
+                    saved_config = json.load(metadata_file)
+                saved_identity = saved_config.get("backbone_identity")
+                if saved_identity:
+                    break
+        validate_saved_identity(saved_identity, capabilities)
     if model_args.use_reasoning_network and model_args.num_pause_steps > 0 and model_args.use_qwen3_embedding_model:
         model.init_qwen3_embedding_model()
     data_args.output_dir = training_args.output_dir
-    dataset = SALMONN_Dataset(data_args, tokenizer, model_args.encoder_type, model_args.llm_type)
+    dataset = SALMONN_Dataset(
+        data_args,
+        tokenizer,
+        model_args.encoder_type,
+        model_args.llm_type,
+        backbone_capabilities=capabilities,
+    )
     if model_args.inject_temporal_embedding:
         model.register_temporal_tokens(tokenizer)
     if getattr(model_args, "inject_temporal_embedding_nl", False):
@@ -272,6 +294,10 @@ def main():
         )
 
     tokenizer, model, dataset = load_model_and_dataset(model_args, data_args, training_args)
+    config["backbone_identity"] = dict(model.config.backbone_identity)
+    config["backbone_identity"]["base_model_path"] = model_args.base_llm_path
+    with open(os.path.join(training_args.output_dir, "config.json"), "w") as f:
+        json.dump(config, f, indent=4, ensure_ascii=False)
 
     # When doing delayed encoder unfreezing, encoder params must have requires_grad=True
     # from the very start so DeepSpeed ZeRO includes them in its partitioning.

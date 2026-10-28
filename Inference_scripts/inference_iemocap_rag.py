@@ -438,12 +438,8 @@ def evaluate(
         prompt = build_rag_prompt(base_prompt, rag_context)
 
         messages = [{"role": "user", "content": "<audio>" + prompt}]
-        text = tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=True,
-        )
+        from backbone_compat import render_chat
+        text = render_chat(tokenizer, messages, add_generation_prompt=True, enable_thinking=True)
 
         feature_t, feature_lens_t, raw_wavs_t, audio_nums = get_feature_tensors(audio_path, fbank, model, model_args)
         model_inputs = cast(dict[str, Any], prepare_model_inputs(text, audio_nums, tokenizer, model, model_args))

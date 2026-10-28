@@ -1,6 +1,7 @@
 import os
 import sys
 import contextlib
+import copy
 
 from transformers import PreTrainedModel, AutoModelForCausalLM, StoppingCriteriaList, StoppingCriteria, AutoFeatureExtractor, AutoConfig
 from peft import LoraConfig, TaskType, get_peft_model
@@ -10,7 +11,16 @@ import torch.nn.functional as F
 from torch.nn.utils import rnn
 from typing import List, Optional, Tuple, Union
 from transformers.modeling_outputs import CausalLMOutputWithPast
-from models.reasoning_network import ReasoningNetwork
+try:
+    from models.reasoning_network import ReasoningNetwork
+except ModuleNotFoundError:
+    ReasoningNetwork = None
+from backbone_compat import (
+    get_decoder_layer_name,
+    log_backbone_summary,
+    resolve_tokenizer_capabilities,
+    validate_tokenizer_embedding_size,
+)
 from spear_encoder.zipformer_peft import (
     ZIPFORMER_BALANCED_PEFT_TARGET_MODULES,
     convert_activation_dropout_and_linear_in_place,
@@ -90,13 +100,13 @@ class SALMONN(PreTrainedModel):
         self.freeze_encoder = model_args.freeze_encoder
         self.llm_type = model_args.llm_type
         self.llm_model_type = getattr(config, "model_type", "")
-        if self.llm_type == "Llama":
-            self._no_split_modules =  ["LlamaDecoderLayer"]
-        elif self.llm_type == "Qwen":
-            if self.llm_model_type == "qwen3_moe":
-                self._no_split_modules = ["Qwen3MoeDecoderLayer"]
-            else:
-                self._no_split_modules = ["Qwen3DecoderLayer"]
+        self._no_split_modules = [get_decoder_layer_name(config)]
+        self.backbone_capabilities = None
+        self.audio_start_token_id = None
+        self.audio_end_token_id = None
+        self.chat_end_token_id = None
+        self.llm_pad_token_id = None
+        self.llm_eos_token_ids = ()
 
         if model_args.base_llm_path:
             self.base_llm = AutoModelForCausalLM.from_pretrained(
@@ -106,6 +116,7 @@ class SALMONN(PreTrainedModel):
             )
         else:
             self.base_llm = AutoModelForCausalLM.from_config(config)
+        self.original_llm_vocab_size = int(self.base_llm.config.vocab_size)
 
         expand_vocab = getattr(model_args, "expand_vocab", False)
         freeze_llm = getattr(model_args, "freeze_llm", False)
@@ -294,6 +305,11 @@ class SALMONN(PreTrainedModel):
         self.freeze_qwen3_embedding_model = getattr(model_args, "freeze_qwen3_embedding_model", True)
         if self.num_pause_steps > 0:
             if self.use_reasoning_network:
+                if ReasoningNetwork is None:
+                    raise ImportError(
+                        "use_reasoning_network=True requires models/reasoning_network.py, "
+                        "which is not present in this checkout."
+                    )
                 user_prompt_embed_dim = config.hidden_size
                 if self.use_qwen3_embedding_model:
                     if not self.qwen3_embedding_model_path:
@@ -385,6 +401,42 @@ class SALMONN(PreTrainedModel):
     SPEAKER_TOKENS = ["<|speaker1|>", "<|speaker2|>", "<|speaker3|>", "<|speaker4|>", "<|speaker5|>"]
     NEW_SPECIAL_TOKENS = TIMESTAMP_TOKENS + SPEAKER_TOKENS
 
+    def register_backbone_tokenizer(self, tokenizer):
+        """Validate and register tokenizer-derived IDs required by forward/generate."""
+        capabilities = resolve_tokenizer_capabilities(tokenizer, self.base_llm.config)
+        validate_tokenizer_embedding_size(tokenizer, self.base_llm)
+        self.backbone_capabilities = capabilities
+        self.audio_start_token_id = capabilities.audio_start_token_id
+        self.audio_end_token_id = capabilities.audio_end_token_id
+        self.chat_end_token_id = capabilities.im_end_token_id
+        self.llm_pad_token_id = capabilities.pad_token_id
+        self.llm_eos_token_ids = capabilities.eos_token_ids
+        identity = capabilities.metadata()
+        identity.update(
+            {
+                "architectures": getattr(self.base_llm.config, "architectures", None),
+                "hidden_size": getattr(self.base_llm.config, "hidden_size", None),
+                "original_vocab_size": self.original_llm_vocab_size,
+                "embedding_vocab_size": self.base_llm.get_input_embeddings().num_embeddings,
+            }
+        )
+        self.config.backbone_identity = identity
+        log_backbone_summary(self.base_llm.config, capabilities)
+        return capabilities
+
+    def _get_input_embeddings(self):
+        embeddings = self.base_llm.get_input_embeddings()
+        if embeddings is None:
+            raise RuntimeError("The language backbone does not expose input embeddings.")
+        return embeddings
+
+    def _require_registered_tokenizer(self):
+        if self.backbone_capabilities is None:
+            raise RuntimeError(
+                "Backbone tokenizer has not been registered. Call "
+                "model.register_backbone_tokenizer(tokenizer) before forward/generate."
+            )
+
     def register_temporal_tokens(self, tokenizer):
         """Store a map from TIMESTAMP_TOKENS index -> token_id for use in inject_temporal_embeddings.
 
@@ -435,7 +487,7 @@ class SALMONN(PreTrainedModel):
         audio_embeds = audio_embeds.view(bsz, num_blocks, K, dim)  # (bsz, num_blocks, K, dim)
 
         # 3. Build one timestamp embedding per block: block i gets <|(i+1)*granularity|>
-        embed_tokens = self.base_llm.get_input_embeddings()
+        embed_tokens = self._get_input_embeddings()
         block_indices = torch.arange(num_blocks, device=audio_embeds.device)
         ts_times = (block_indices + 1).float() * self.temporal_granularity
         ts_list_indices = ts_times.div(0.1).round().long().clamp(0, len(self.timestamp_token_ids) - 1)
@@ -503,7 +555,7 @@ class SALMONN(PreTrainedModel):
             audio_embeds = F.pad(audio_embeds, (0, 0, 0, pad_len))
 
         # 2. Pre-compute timestamp embeddings for every block
-        embed_tokens = self.base_llm.get_input_embeddings()
+        embed_tokens = self._get_input_embeddings()
         block_ts_embs = []   # list of (ts_len_i, dim) tensors
         ts_lens = []
         for i in range(num_blocks):
@@ -598,7 +650,20 @@ class SALMONN(PreTrainedModel):
             lora_dropout=model_args.lora_dropout,
             use_dora=dora,
         )
-        if getattr(self.base_llm.config, "model_type", "") == "qwen3_moe":
+        model_type = getattr(self.base_llm.config, "model_type", "")
+        if model_type == "qwen2":
+            # PEFT 0.x defaults to q_proj/v_proj for Qwen2. Train the complete
+            # attention + MLP projection set intended by SALMONN fine-tuning.
+            lora_kwargs["target_modules"] = [
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            ]
+        elif model_type == "qwen3_moe":
             lora_kwargs["target_modules"] = [
                 "q_proj",
                 "k_proj",
@@ -1125,7 +1190,7 @@ class SALMONN(PreTrainedModel):
         padding_id,
         external_user_prompt_embeds=None,
     ):
-        eos_id = 151645 if self.llm_type == "Qwen" else None
+        eos_id = self.chat_end_token_id
         _, seqlen, _ = audio_embeds.size()
         bsz = input_ids.shape[0]
         input_embeds_list = []
@@ -1138,10 +1203,7 @@ class SALMONN(PreTrainedModel):
             user_prompt_list = []
             reasoning_insert_at = []
             for i in range(bsz):
-                if is_peft_model(self.base_llm):
-                    current_input_embeds = self.base_llm.model.model.embed_tokens(input_ids[i].to(torch.int64))
-                else:
-                    current_input_embeds = self.base_llm.model.embed_tokens(input_ids[i].to(torch.int64))
+                current_input_embeds = self._get_input_embeddings()(input_ids[i].to(torch.int64))
                 current_labels = labels[i]
                 # find where currect_input_ids == bos_id, return all the index, this will be used for injecting audio embedding
                 bos_idx = (input_ids[i] == bos_id).nonzero(as_tuple=True)[0]
@@ -1256,10 +1318,7 @@ class SALMONN(PreTrainedModel):
         reasoning_audio_list = []
         user_prompt_list = []
         for i in range(bsz):
-            if is_peft_model(self.base_llm):
-                current_input_embeds = self.base_llm.model.model.embed_tokens(input_ids[i].to(torch.int64))
-            else:
-                current_input_embeds = self.base_llm.model.embed_tokens(input_ids[i].to(torch.int64))
+            current_input_embeds = self._get_input_embeddings()(input_ids[i].to(torch.int64))
             # find where currect_input_ids == bos_id, return all the index
             bos_idx = (input_ids[i] == bos_id).nonzero(as_tuple=True)[0]
             padding_idx = (input_ids[i] == padding_id).nonzero(as_tuple=True)[0]
@@ -1356,12 +1415,9 @@ class SALMONN(PreTrainedModel):
         ctx_raw_wavs=None,
         audio_feature_groups=None,
     ):
-        if self.llm_type == "Qwen":
-            bos_id = 151652
-            padding_id = 151643
-        elif self.llm_type == "Llama":
-            bos_id = 128002
-            padding_id = 128004
+        self._require_registered_tokenizer()
+        audio_start_token_id = self.audio_start_token_id
+        padding_id = self.llm_pad_token_id
         audio_embeds, audio_embeds_lens = self.encode_audio(fbank_feature, fbank_feature_len, raw_wavs)
         if self.inject_temporal_embedding:
             audio_embeds, audio_embeds_lens = self.inject_temporal_embeddings(audio_embeds, audio_embeds_lens)
@@ -1406,7 +1462,7 @@ class SALMONN(PreTrainedModel):
                 labels,
                 audio_embeds,
                 audio_embeds_lens,
-                bos_id,
+                audio_start_token_id,
                 padding_id,
                 external_user_prompt_embeds=external_user_prompt_embeds,
             )
@@ -1421,13 +1477,10 @@ class SALMONN(PreTrainedModel):
         if labels is not None:
             labels_list = []
             for i in range(bsz):
-                if is_peft_model(self.base_llm):
-                    current_input_embeds = self.base_llm.model.model.embed_tokens(input_ids[i].to(torch.int64))
-                else:
-                    current_input_embeds = self.base_llm.model.embed_tokens(input_ids[i].to(torch.int64))
+                current_input_embeds = self._get_input_embeddings()(input_ids[i].to(torch.int64))
                 current_labels = labels[i]
                 # find where currect_input_ids == bos_id, return all the index, this will be used for injecting audio embedding
-                bos_idx = (input_ids[i] == bos_id).nonzero(as_tuple=True)[0]
+                bos_idx = (input_ids[i] == audio_start_token_id).nonzero(as_tuple=True)[0]
                 for idx in bos_idx:
                     if has_ctx_audio:
                         audio_group = int(audio_feature_groups[audio_num].item())
@@ -1507,12 +1560,9 @@ class SALMONN(PreTrainedModel):
             return input_embeds, attention_mask, labels
 
         for i in range(bsz):
-            if is_peft_model(self.base_llm):
-                current_input_embeds = self.base_llm.model.model.embed_tokens(input_ids[i].to(torch.int64))
-            else:
-                current_input_embeds = self.base_llm.model.embed_tokens(input_ids[i].to(torch.int64))
+            current_input_embeds = self._get_input_embeddings()(input_ids[i].to(torch.int64))
             # find where currect_input_ids == bos_id, return all the index
-            bos_idx = (input_ids[i] == bos_id).nonzero(as_tuple=True)[0]
+            bos_idx = (input_ids[i] == audio_start_token_id).nonzero(as_tuple=True)[0]
             padding_idx = (input_ids[i] == padding_id).nonzero(as_tuple=True)[0]
             for idx in bos_idx:
                 if has_ctx_audio:
@@ -1652,9 +1702,11 @@ class SALMONN(PreTrainedModel):
         generation_config=None,
         **kwargs,
     ):
+        self._require_registered_tokenizer()
         if generation_config is None:
-            from transformers import GenerationConfig
-            generation_config = GenerationConfig.from_model_config(self.config)
+            generation_config = copy.deepcopy(self.base_llm.generation_config)
+        else:
+            generation_config = copy.deepcopy(generation_config)
 
         # 使用 kwargs 更新 generation_config
         for key, value in kwargs.items():
@@ -1664,29 +1716,24 @@ class SALMONN(PreTrainedModel):
         if max_new_tokens == 0:
             max_new_tokens = generation_config.max_new_tokens
         eos_token_id = generation_config.eos_token_id
-        if isinstance(eos_token_id, int):
-            eos_token_id = [eos_token_id]
+        if eos_token_id is None:
+            eos_token_id = list(self.llm_eos_token_ids)
+        pad_token_id = generation_config.pad_token_id
+        if pad_token_id is None:
+            pad_token_id = self.llm_pad_token_id
+        generation_config.eos_token_id = eos_token_id
+        generation_config.pad_token_id = pad_token_id
 
         inputs_embeds, attention_mask, _ = self.prepare_inputs_labels_for_speech(
             input_ids, None, None, fbank_feature, fbank_feature_len, raw_wavs, user_prompts
         )
 
-        stopping_criteria = StoppingCriteriaList([StoppingCriteriaSub(stops=[torch.tensor([generation_config.eos_token_id]).cuda()])])
-
         with self.maybe_autocast():
             outputs = self.base_llm.generate(
                 inputs_embeds=inputs_embeds,
                 max_new_tokens=max_new_tokens,
-                stopping_criteria=stopping_criteria,
-                num_beams=generation_config.num_beams,
-                do_sample=generation_config.do_sample,
-                min_length=generation_config.min_length,
-                temperature=generation_config.temperature,
-                top_p=generation_config.top_p,
-                repetition_penalty=generation_config.repetition_penalty,
-                length_penalty=generation_config.length_penalty,
+                generation_config=generation_config,
                 attention_mask=attention_mask,
-                pad_token_id=self.base_llm.config.eos_token_id
             )
         
         return outputs

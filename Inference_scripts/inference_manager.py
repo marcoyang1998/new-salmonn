@@ -9,10 +9,8 @@ import os
 import json
 from tqdm import tqdm
 from inference_utils import get_prompt, get_audio_path_list, get_prefix_audio_num, extract_audio_features, get_fbank, maybe_init_qwen3_embedding_model, prepare_model_inputs, get_model_args, OVERRIDE_KEYS, override_args_from_config
+from backbone_compat import clean_generated_output, render_chat, validate_saved_identity
 import logging
-
-TOKENIZER_PATH="/mnt/shared-storage-gpfs2/brainllm2-share/xiaoyu/models/Qwen3-8B"
-
 
 class InferenceManager:
     def __init__(
@@ -24,7 +22,7 @@ class InferenceManager:
         task_filter=None,
         split_audio: bool = False,
         disable_thinking: bool=True,
-        tokenizer_path: str = TOKENIZER_PATH,
+        tokenizer_path: Optional[str] = None,
         use_beam_search: bool = False,
         beam_size: int = 4,
         length_penalty: float = 1.0,
@@ -59,8 +57,7 @@ class InferenceManager:
         self.use_oracle_biasing_list = use_oracle_biasing_list
         self.use_ctx_audio = use_ctx_audio
         self.prompt_task_override = prompt_task_override
-        # TODO: check if using checkpoint_path is safe
-        self.tokenizer = AutoTokenizer.from_pretrained(checkpoint_path)
+        self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path or checkpoint_path)
         self.fbank = get_fbank(self.model_args)
         self.model = self._load_model()
         self.disable_thinking = disable_thinking
@@ -77,6 +74,13 @@ class InferenceManager:
             model.register_temporal_tokens(self.tokenizer)
         if getattr(self.model_args, "inject_temporal_embedding_nl", False):
             model.register_nl_timestamp_tokenizer(self.tokenizer)
+        saved_identity = getattr(model.config, "backbone_identity", None)
+        capabilities = model.register_backbone_tokenizer(self.tokenizer)
+        metadata_file = os.path.join(os.path.dirname(self.model_args.model_name_or_path), "config.json")
+        if os.path.isfile(metadata_file):
+            with open(metadata_file) as config_handle:
+                saved_identity = json.load(config_handle).get("backbone_identity", saved_identity)
+        validate_saved_identity(saved_identity, capabilities)
         maybe_init_qwen3_embedding_model(model, self.model_args)
         model.eval()
         return model
@@ -100,8 +104,11 @@ class InferenceManager:
             audio_num = get_prefix_audio_num(prompt_sample)
             audio_paths.extend(audio_path_list)
             messages = [{"role": "user", "content": "<audio>" * audio_num + prompt}]
-            text = self.tokenizer.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True, enable_thinking=not self.disable_thinking,
+            text = render_chat(
+                self.tokenizer,
+                messages,
+                add_generation_prompt=True,
+                enable_thinking=not self.disable_thinking,
             )
             texts.append(text)
 
@@ -142,10 +149,7 @@ class InferenceManager:
         for i, generated_id in enumerate(generated_ids):
             output_ids = generated_id.tolist()
             content = self.tokenizer.decode(output_ids, skip_special_tokens=True).strip("\n")
-            cleaned_content = content.split("</think>")[-1].strip()
-            # TODO: fix this bug
-            if cleaned_content.startswith("<think>\n\n"):
-                cleaned_content = cleaned_content.replace("<think>\n\n", "", 1).strip()
+            cleaned_content = clean_generated_output(content, self.model.backbone_capabilities)
             sample = batch_data[i]
             sample["response"] = cleaned_content
             json.dump(sample, out_file, ensure_ascii=False)

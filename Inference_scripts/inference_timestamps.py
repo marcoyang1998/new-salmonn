@@ -16,6 +16,7 @@ from transformers import AutoFeatureExtractor
 import os
 import soundfile as sf
 from inference_utils import ModelArguments, maybe_init_qwen3_embedding_model, override_args_from_config
+from backbone_compat import clean_generated_output
 
 from petrel_client.client import Client
 
@@ -97,6 +98,7 @@ model = SALMONN.from_pretrained(
     torch_dtype="auto",
     device_map="auto"
 )
+model.register_backbone_tokenizer(tokenizer)
 if getattr(model_args, "inject_temporal_embedding", False):
     model.register_temporal_tokens(tokenizer)
 if getattr(model_args, "inject_temporal_embedding_nl", False):
@@ -208,16 +210,9 @@ for i, item in enumerate(tqdm(data)):
         raw_wavs = torch.nn.utils.rnn.pad_sequence(raw_wavs, batch_first=True).to(model.device)
     feature_lens = torch.tensor(feature_lens, device=model.device)
 
-    if model_args.llm_type == "Qwen":
-        if model_args.split_audio and len(audio_nums) > 0:
-            text_for_model = text
-            for one_audio_num in audio_nums:
-                text_for_model = text_for_model.replace("<audio>", "<|vision_start|>" * one_audio_num + "<|vision_end|>", 1)
-            model_inputs = tokenizer([text_for_model], return_tensors="pt").to(model.device)
-        else:
-            model_inputs = tokenizer([text.replace("<audio>","<|vision_start|><|vision_end|>")], return_tensors="pt").to(model.device)
-    elif model_args.llm_type == "Llama":
-        model_inputs = tokenizer([text.replace("<audio>","<|reserved_special_token_0|><|reserved_special_token_1|>")], return_tensors="pt").to(model.device)
+    from inference_utils import prepare_model_inputs
+    groups = audio_nums if model_args.split_audio and audio_nums else [1] * text.count("<audio>")
+    model_inputs = prepare_model_inputs([text], groups, tokenizer, model)
 
     # conduct text completion
     generated_ids = model.generate(
@@ -229,22 +224,14 @@ for i, item in enumerate(tqdm(data)):
         max_new_tokens=500
     )
     
-    # parsing thinking content
     output_ids = generated_ids[0][:].tolist()
-    try:
-        # rindex finding 151668 (</think>)
-        index = len(output_ids) - output_ids[::-1].index(151668)
-    except ValueError:
-        index = 0
-    
     # since we expanded the vocab, we do not skip special tokens
     if model_args.expand_vocab:
-        thinking_content = tokenizer.decode(output_ids[:index], skip_special_tokens=False).strip("\n")
-        content = tokenizer.decode(output_ids[index:], skip_special_tokens=False).strip("\n")
+        content = tokenizer.decode(output_ids, skip_special_tokens=False).strip("\n")
         content = content.replace("<|im_end|>", "")
     else:
-        thinking_content = tokenizer.decode(output_ids[:index], skip_special_tokens=True).strip("\n")
-        content = tokenizer.decode(output_ids[index:], skip_special_tokens=True).strip("\n") 
+        content = tokenizer.decode(output_ids, skip_special_tokens=True).strip("\n")
+    content = clean_generated_output(content, model.backbone_capabilities)
 
     model_output = content.strip()
     model_output = model_output.strip(".")
