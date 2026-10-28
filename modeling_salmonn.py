@@ -651,19 +651,7 @@ class SALMONN(PreTrainedModel):
             use_dora=dora,
         )
         model_type = getattr(self.base_llm.config, "model_type", "")
-        if model_type == "qwen2":
-            # PEFT 0.x defaults to q_proj/v_proj for Qwen2. Train the complete
-            # attention + MLP projection set intended by SALMONN fine-tuning.
-            lora_kwargs["target_modules"] = [
-                "q_proj",
-                "k_proj",
-                "v_proj",
-                "o_proj",
-                "gate_proj",
-                "up_proj",
-                "down_proj",
-            ]
-        elif model_type == "qwen3_moe":
+        if model_type == "qwen3_moe":
             lora_kwargs["target_modules"] = [
                 "q_proj",
                 "k_proj",

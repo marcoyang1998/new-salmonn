@@ -161,3 +161,16 @@ def test_reserved_embedding_rows_are_allowed():
         get_input_embeddings=lambda: SimpleNamespace(num_embeddings=len(tokenizer) + 399)
     )
     validate_tokenizer_embedding_size(tokenizer, model)
+
+
+def test_peft_qwen2_default_lora_targets_match_dense_qwen3():
+    from peft.utils.constants import TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING
+
+    assert TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING["qwen2"] == [
+        "q_proj",
+        "v_proj",
+    ]
+    assert (
+        TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING["qwen2"]
+        == TRANSFORMERS_MODELS_TO_LORA_TARGET_MODULES_MAPPING["qwen3"]
+    )
