@@ -158,6 +158,12 @@ class SALMONN(PreTrainedModel):
             print("[SALMONN.__init__] freeze_llm=True: all base_llm parameters frozen.")
         
         self.concat_encoder_features = getattr(model_args, "concat_encoder_features", False)
+        self.weighted_sum_encoder_mlp = getattr(model_args, "weighted_sum_encoder_mlp", False)
+        if self.weighted_sum_encoder_mlp:
+            if self.concat_encoder_features:
+                raise ValueError("weighted_sum_encoder_mlp and concat_encoder_features are mutually exclusive.")
+            if self.encoder_type != "zipformer2":
+                raise ValueError("weighted_sum_encoder_mlp is only supported for SPEAR (zipformer2).")
         
         if self.encoder_type == "dasheng_wavlm":
             self.audio_encoder, self.speech_encoder = self.get_audio_encoder(model_args)
@@ -206,6 +212,16 @@ class SALMONN(PreTrainedModel):
                 # assert not self.weighted_sum_encoder, "Cannot concat encoder features when using weighted sum"
                 num_encoder_layers = self.audio_encoder.num_encoder_layers
                 self.concat_proj = nn.Linear(int(num_encoder_layers * encoder_dim), encoder_dim)
+            if self.weighted_sum_encoder_mlp:
+                hidden_size = getattr(model_args, "weighted_sum_mlp_hidden_size", 8320)
+                if hidden_size <= 0:
+                    raise ValueError("weighted_sum_mlp_hidden_size must be positive.")
+                self.encoder_layer_weights = nn.Parameter(torch.zeros(num_encoder_layers))
+                self.aggregation_mlp = nn.Sequential(
+                    nn.Linear(encoder_dim, hidden_size),
+                    nn.GELU(),
+                    nn.Linear(hidden_size, encoder_dim),
+                )
             self.ln_audio = nn.LayerNorm(encoder_dim)
         elif self.encoder_type == "spear_transformer":
             encoder_dim = self.audio_encoder.encoder_dim
@@ -868,6 +884,17 @@ class SALMONN(PreTrainedModel):
                     middle_out = [F.layer_norm(m.permute(1,0,2), (m.shape[-1],)) for m in middle_out]
                     middle_out = torch.cat(middle_out, dim=-1) # (N,T,num_layers * C)
                     audio_embeds = self.concat_proj(middle_out) # (N,T,C)
+                elif self.weighted_sum_encoder_mlp:
+                    # Normalize each layer without affine parameters, as in concat.
+                    # Keep aggregation outside the frozen encoder's no-grad context.
+                    weights = self.encoder_layer_weights.softmax(dim=0)
+                    if len(middle_out) != weights.numel():
+                        raise ValueError("SPEAR hidden-state count does not match encoder_layer_weights.")
+                    audio_embeds = sum(
+                        weights[i] * F.layer_norm(m.permute(1, 0, 2), (m.shape[-1],))
+                        for i, m in enumerate(middle_out)
+                    )
+                    audio_embeds = self.aggregation_mlp(audio_embeds)
                 audio_embeds = self.ln_audio(audio_embeds)
                 raw_audio_embeds_len = encoder_out_lens.to(torch.int64)
             if self.encoder_type == "spear_transformer":

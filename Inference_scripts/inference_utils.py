@@ -56,6 +56,8 @@ class ModelArguments:
     connector_hid_size: int = 4096
     weighted_sum_encoder: bool = False
     concat_encoder_features: bool = False
+    weighted_sum_encoder_mlp: bool = False
+    weighted_sum_mlp_hidden_size: int = 8320
     zipformer_version: str = "xlarge"
     split_audio: bool = True
     audio_chunk: int = 60
@@ -84,6 +86,8 @@ OVERRIDE_KEYS = [
     "llm_type",
     "weighted_sum_encoder",
     "concat_encoder_features",
+    "weighted_sum_encoder_mlp",
+    "weighted_sum_mlp_hidden_size",
     "zipformer_version",
     "audio_encoder_path",
     "speech_encoder_path",

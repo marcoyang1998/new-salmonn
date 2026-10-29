@@ -37,6 +37,8 @@ class ModelArguments:
     connector_seg_size: int = field(default=5)
     connector_hid_size: int = field(default=4096)
     concat_encoder_features: bool = field(default=False)
+    weighted_sum_encoder_mlp: bool = field(default=False, metadata={"help": "SPEAR layer-normalized scalar weighted sum followed by a parameter-matched MLP. Mutually exclusive with concat_encoder_features."})
+    weighted_sum_mlp_hidden_size: int = field(default=8320, metadata={"help": "Hidden width of the weighted-sum aggregation MLP (1280 -> 8320 -> 1280 for SPEAR)."})
     encoder_lora: bool = field(default=False)
     encoder_lora_rank: int = field(default=16)
     encoder_lora_alpha: int = field(default=16)
