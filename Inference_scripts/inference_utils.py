@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import io
 from lhotse import Fbank, FbankConfig
 import torchaudio
 import torch
@@ -155,6 +156,38 @@ def _apply_model_args_overrides(model_args, **kwargs):
 
 audio_chunk = 30 * 16000
 max_frames = 120 * 16000
+
+PETRELOSS_CONFIG = "/mnt/shared-storage-user/housiyuan/xiaoyu/petreloss.conf"
+_inference_audio_client = None
+
+
+def load_audio_from_petrel_oss(audio_path: str, client):
+    bytes_data = client.get(audio_path)
+    waveform, orig_sr = torchaudio.load(io.BytesIO(bytes_data))
+    return waveform, orig_sr
+
+
+def _load_audio(audio: str, start_time=None, end_time=None):
+    """Load local or Petrel S3 audio, matching SALMONN_Dataset._load_audio."""
+    global _inference_audio_client
+    if audio.startswith("s3://"):
+        if _inference_audio_client is None:
+            from petrel_client.client import Client
+            _inference_audio_client = Client(PETRELOSS_CONFIG)
+        waveform, fs = load_audio_from_petrel_oss(audio, _inference_audio_client)
+    else:
+        waveform, fs = torchaudio.load(audio)
+    if start_time is None and end_time is None:
+        return waveform, fs
+    if start_time is None or end_time is None:
+        raise ValueError(f"Both start_time and end_time must be provided for audio span loading: {audio}")
+    start_frame = max(0, int(round(float(start_time) * fs)))
+    end_frame = min(waveform.shape[1], int(round(float(end_time) * fs)))
+    if end_frame <= start_frame:
+        raise ValueError(
+            f"Invalid audio span for {audio}: start_time={start_time}, end_time={end_time}, fs={fs}"
+        )
+    return waveform[:, start_frame:end_frame], fs
 
 def get_prompt(sample: dict, use_oracle_biasing_list: bool = False, use_ctx_audio: bool = True) -> str:
     task = sample["task"]
@@ -323,7 +356,7 @@ def extract_audio_features(audio_paths: list[str], fbank: Fbank, model, model_ar
     audio_nums = []
     feature_lens = []
     for audio_path in audio_paths:
-        audio, fs = torchaudio.load(audio_path)
+        audio, fs = _load_audio(audio_path)
         if fs != 16000:
             audio = torchaudio.functional.resample(audio, fs, 16000)
             fs = 16000
