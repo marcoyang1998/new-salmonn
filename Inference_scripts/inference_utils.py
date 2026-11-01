@@ -396,6 +396,10 @@ def extract_audio_features(audio_paths: list[str], fbank: Fbank, model, model_ar
 
         if not split_audio:
             features.append(extracted)
+            # One feature row corresponds to one audio placeholder when audio
+            # splitting is disabled. prepare_model_inputs consumes one entry
+            # from audio_nums for each <audio> marker in the rendered batch.
+            audio_nums.append(1)
 
     if model_args.encoder_type == "whisper_beats":
         feature_lens = [f.size(0) for f in raw_wavs]
